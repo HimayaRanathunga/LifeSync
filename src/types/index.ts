@@ -33,6 +33,10 @@ export interface Habit {
   recurring: boolean;
   daysOfWeek: number[]; // 0 (Sun) - 6 (Sat)
   preferredTime: string; // "HH:mm"
+  // Optional: the onboarding picker's choice, absent on habits created before it was persisted.
+  // Drives the card icon/colour in HabitsListScreen; without it the icon is hashed from the
+  // document id, which is why "Drink 500ml Water" could show a dumbbell.
+  category?: string;
   createdAt: number;
 }
 
@@ -55,9 +59,13 @@ export interface Recommendation {
 export interface HealthLog {
   id: string;
   date: string; // "YYYY-MM-DD"
-  sleepHours: number;
-  waterMl: number;
-  steps: number;
+  // All three are optional because every writer is a partial merge: incrementSteps creates the
+  // day's document with only `steps`, incrementWaterMl with only `waterMl`. A document that
+  // exists therefore routinely lacks the other fields, and typing them as required hid the
+  // missing `?? 0` guards from the compiler.
+  sleepHours?: number;
+  waterMl?: number;
+  steps?: number;
 }
 
 export interface FoodItem {
@@ -98,9 +106,6 @@ export interface FoodAnalysis {
   // calibration model — absent (not a generic default) when nothing matched.
   calibrationNote?: string;
   calibrationAvgDiffPct?: number;
-  // True when this result is a canned example (Gemini + Cloud Function both failed/timed out),
-  // not a real analysis of the photo — see FALLBACK_MEALS in src/services/foodService.ts.
-  isFallback?: boolean;
 }
 
 export interface FoodLog extends FoodAnalysis {

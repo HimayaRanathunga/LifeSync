@@ -16,6 +16,7 @@ import {
 import { functions, db } from '../config/firebase';
 import type { AnalyzeFoodRequest, FoodAnalysis, FoodLog } from '../types';
 import type { Page } from './logsService';
+import { toDateKey } from '../utils/dates';
 
 const analyzeFoodPhotoCallable = httpsCallable<AnalyzeFoodRequest, FoodAnalysis>(functions, 'analyzeFoodPhoto');
 
@@ -93,6 +94,51 @@ export const HEALTHY_MEAL_SUGGESTIONS: HealthySuggestion[] = [
   },
 ];
 
+/**
+ * Coerces a model response into the shape the rest of the app relies on.
+ *
+ * The prompt asks for a fixed JSON schema, but a language model can still omit a field, return a
+ * number as a string, or emit foodItems as bare strings instead of objects. Every consumer
+ * downstream (evaluateFoodHealth, the scan screen, the Firestore write) assumed the schema was
+ * honoured, so a single missing `name` threw and discarded an otherwise-good analysis.
+ */
+function normalizeAnalysis(raw: any): FoodAnalysis {
+  const num = (v: any, fallback = 0): number => {
+    const n = typeof v === 'string' ? parseFloat(v) : v;
+    return typeof n === 'number' && Number.isFinite(n) ? n : fallback;
+  };
+
+  const items = Array.isArray(raw?.foodItems) ? raw.foodItems : [];
+
+  return {
+    ...raw,
+    isFood: raw?.isFood !== false,
+    mealTitle: typeof raw?.mealTitle === 'string' ? raw.mealTitle : '',
+    foodItems: items.map((it: any) => {
+      // Some responses give a plain string per item rather than the object the schema asks for.
+      if (typeof it === 'string') {
+        return { name: it, estimatedPortion: '', estimatedPortionGrams: 0, calories: 0 };
+      }
+      return {
+        ...it,
+        name: typeof it?.name === 'string' && it.name.trim() ? it.name : 'Unidentified item',
+        estimatedPortion: typeof it?.estimatedPortion === 'string' ? it.estimatedPortion : '',
+        estimatedPortionGrams: num(it?.estimatedPortionGrams),
+        calories: num(it?.calories),
+      };
+    }),
+    totalCalories: num(raw?.totalCalories),
+    macros: {
+      proteinGrams: num(raw?.macros?.proteinGrams),
+      carbsGrams: num(raw?.macros?.carbsGrams),
+      fatGrams: num(raw?.macros?.fatGrams),
+    },
+    condition: typeof raw?.condition === 'string' ? raw.condition : '',
+    healthTip: typeof raw?.healthTip === 'string' ? raw.healthTip : '',
+    confidence: num(raw?.confidence, 0),
+  } as FoodAnalysis;
+}
+
 export function evaluateFoodHealth(analysis: FoodAnalysis): {
   isFood: boolean;
   nonFoodReason?: string;
@@ -136,7 +182,10 @@ export function evaluateFoodHealth(analysis: FoodAnalysis): {
   if (totalCalories > 850) score -= 14;
   else if (totalCalories <= 650 && totalCalories >= 350) score += 8;
 
-  const itemNames = (foodItems ?? []).map((i) => i.name.toLowerCase()).join(' ');
+  // `?? ''` on the name too: these objects come from a language model, which occasionally omits
+  // a field even when the response schema asks for it. An undefined name previously threw
+  // "Cannot read property 'toLowerCase' of undefined" and lost the entire analysis.
+  const itemNames = (foodItems ?? []).map((i) => (i?.name ?? '').toLowerCase()).join(' ');
   
   // Sri Lankan vegetables and wholesome greens boosts
   if (/gotukola|mukunuwenna|kankun|kathurumurunga|mallum|polos|parippu|dhal|bandakka|wattakka|karawila|kohila|murunga|nelum|kadala|mun ata|salad|greens|salmon|quinoa/i.test(itemNames)) {
@@ -217,182 +266,11 @@ export function evaluateFoodHealth(analysis: FoodAnalysis): {
   };
 }
 
-export const FALLBACK_MEALS: FoodAnalysis[] = [
-  {
-    isFood: true,
-    mealTitle: 'Sri Lankan Red Rice, Polos (Jackfruit) Curry, Dhal & Gotukola Mallum',
-    sriLankanDishType: 'Traditional Sri Lankan Village Lunch Plate (Rathu Kekulu & Veggies)',
-    foodItems: [
-      { name: 'Rathu Kekulu Red Raw Rice', estimatedPortion: '1 medium cup (~180g)', estimatedPortionGrams: 180, calories: 215, matchedCategory: 'rice', calibratedCalories: 215 },
-      { name: 'Tender Baby Jackfruit (Polos) Ambula', estimatedPortion: '1 portion (~140g)', estimatedPortionGrams: 140, calories: 125, matchedCategory: 'polos', calibratedCalories: 125 },
-      { name: 'Sri Lankan Parippu (Red Dhal) Curry', estimatedPortion: '1/2 cup (~100g)', estimatedPortionGrams: 100, calories: 115, matchedCategory: 'dhal', calibratedCalories: 115 },
-      { name: 'Fresh Gotukola & Coconut Mallum', estimatedPortion: '1/2 cup (~60g)', estimatedPortionGrams: 60, calories: 45, matchedCategory: 'salad', calibratedCalories: 45 },
-    ],
-    totalCalories: 500,
-    macros: { proteinGrams: 22, carbsGrams: 78, fatGrams: 12 },
-    condition: 'Freshly prepared traditional village curry in light coconut milk with turmeric, curry leaves, and mustard',
-    healthRating: 'GOOD',
-    healthScore: 96,
-    healthVerdict: 'Excellent High-Fiber & Low-GI Nutritional Profile',
-    habitImpactStatus: 'EXCELLENT_FOR_HABITS',
-    habitImpactReason: 'Supercharges daily habits! The high prebiotic fiber in Polos and Gotukola stabilizes blood glucose, while Red Rice provides 5+ hours of sustained energy for study, focus, and workouts without insulin spikes.',
-    healthTip: 'Polos is an incredible plant-based meat alternative rich in dietary fiber. Gotukola provides powerful neuroprotective polyphenols for mental alertness.',
-    confidence: 0.96,
-    calibrationNote: 'Calibrated with LifeSync Vision Model (Sri Lankan Botanical Reference).',
-  },
-  {
-    isFood: true,
-    mealTitle: 'Sri Lankan Creamy Wattakka (Pumpkin) Curry, Bandakka Theldhala & Samba Rice',
-    sriLankanDishType: 'Traditional Sri Lankan Vegetable Medley Plate',
-    foodItems: [
-      { name: 'Steamed White Samba Rice', estimatedPortion: '1 cup (~160g)', estimatedPortionGrams: 160, calories: 208, matchedCategory: 'rice', calibratedCalories: 208 },
-      { name: 'Creamy Yellow Wattakka (Pumpkin) Curry', estimatedPortion: '1 cup (~150g)', estimatedPortionGrams: 150, calories: 110, matchedCategory: 'pumpkin', calibratedCalories: 110 },
-      { name: 'Tempered Bandakka (Okra) Theldhala', estimatedPortion: '1 portion (~100g)', estimatedPortionGrams: 100, calories: 85, matchedCategory: 'bandakka', calibratedCalories: 85 },
-      { name: 'Fresh Mukunuwenna Mallum', estimatedPortion: '1/2 cup (~50g)', estimatedPortionGrams: 50, calories: 38, matchedCategory: 'salad', calibratedCalories: 38 },
-    ],
-    totalCalories: 441,
-    macros: { proteinGrams: 16, carbsGrams: 74, fatGrams: 10 },
-    condition: 'Cooked fresh with fenugreek, mild green chilies, and light coconut milk',
-    healthRating: 'GOOD',
-    healthScore: 94,
-    healthVerdict: 'Rich in Beta-Carotene, Soluble Fiber & Antioxidants',
-    habitImpactStatus: 'EXCELLENT_FOR_HABITS',
-    habitImpactReason: 'Outstanding for routine health! Wattakka is rich in Vitamin A and potassium for muscle relaxation, while Bandakka mucilage supports smooth digestion and gut wellness.',
-    healthTip: 'Bandakka (Okra) supports healthy blood sugar regulation. A perfect dinner choice that supports restful sleep and metabolic recovery.',
-    confidence: 0.95,
-    calibrationNote: 'Calibrated with LifeSync Vision Model (Sri Lankan Botanical Reference).',
-  },
-  {
-    isFood: true,
-    mealTitle: 'Sri Lankan Fish Ambulthiyal, Karawila Sambol, Dhal & Red Rice',
-    sriLankanDishType: 'Authentic Southern Sri Lankan Seafood & Greens Lunch',
-    foodItems: [
-      { name: 'Rathu Kekulu Red Rice', estimatedPortion: '1 cup (~180g)', estimatedPortionGrams: 180, calories: 215, matchedCategory: 'rice', calibratedCalories: 215 },
-      { name: 'Sour Fish Ambulthiyal (Goraka Tuna)', estimatedPortion: '1 fillet (~120g)', estimatedPortionGrams: 120, calories: 190, matchedCategory: 'fish', calibratedCalories: 190 },
-      { name: 'Crispy Karawila (Bitter Gourd) & Onion Sambol', estimatedPortion: '1/2 cup (~60g)', estimatedPortionGrams: 60, calories: 65, matchedCategory: 'bittergourd', calibratedCalories: 65 },
-      { name: 'Yellow Parippu Dhal Curry', estimatedPortion: '1/2 cup (~100g)', estimatedPortionGrams: 100, calories: 115, matchedCategory: 'dhal', calibratedCalories: 115 },
-    ],
-    totalCalories: 585,
-    macros: { proteinGrams: 42, carbsGrams: 70, fatGrams: 14 },
-    condition: 'Authentic clay pot preparation with Goraka, black pepper, and fresh lime',
-    healthRating: 'GOOD',
-    healthScore: 97,
-    healthVerdict: 'High Lean Protein & Potent Anti-Inflammatory Meal',
-    habitImpactStatus: 'EXCELLENT_FOR_HABITS',
-    habitImpactReason: 'Premier meal for workout habits! High in lean marine protein (42g) and anti-inflammatory Goraka extracts that boost fat metabolism and muscle rebuilding.',
-    healthTip: 'Karawila (Bitter gourd) is world-renowned for natural insulin-like compounds (polypeptide-p) that improve glucose uptake and insulin sensitivity.',
-    confidence: 0.97,
-    calibrationNote: 'Calibrated with LifeSync Vision Model (Sri Lankan Botanical Reference).',
-  },
-  {
-    isFood: true,
-    mealTitle: 'Boiled Kadala (Chickpeas) & Gotukola Sambol with Grated Coconut',
-    sriLankanDishType: 'Traditional Sri Lankan Energy Breakfast',
-    foodItems: [
-      { name: 'Tempered Boiled Kadala with Mustard & Chili', estimatedPortion: '1 bowl (~200g)', estimatedPortionGrams: 200, calories: 285, matchedCategory: 'kadala', calibratedCalories: 285 },
-      { name: 'Fresh Gotukola, Shallots & Lime Sambol', estimatedPortion: '1 cup (~80g)', estimatedPortionGrams: 80, calories: 55, matchedCategory: 'salad', calibratedCalories: 55 },
-      { name: 'Fresh Grated Coconut', estimatedPortion: '2 tbsp (~30g)', estimatedPortionGrams: 30, calories: 105, matchedCategory: 'nuts', calibratedCalories: 105 },
-    ],
-    totalCalories: 445,
-    macros: { proteinGrams: 21, carbsGrams: 52, fatGrams: 16 },
-    condition: 'Freshly tempered with mustard seeds, curry leaves, and sun-dried chili flakes',
-    healthRating: 'GOOD',
-    healthScore: 95,
-    healthVerdict: 'Ideal Clean Plant Protein & Sustained Stamina',
-    habitImpactStatus: 'EXCELLENT_FOR_HABITS',
-    habitImpactReason: 'Perfect morning breakfast! High slow-digesting complex carbs and 21g plant protein fuel high productivity and morning exercise routines effortlessly.',
-    healthTip: 'Pairing legumes with fresh raw greens enhances non-heme iron absorption thanks to natural Vitamin C in lime and Gotukola.',
-    confidence: 0.94,
-    calibrationNote: 'Calibrated with LifeSync Vision Model (Sri Lankan Botanical Reference).',
-  },
-  {
-    isFood: true,
-    mealTitle: 'Sri Lankan Vegetable & Egg Kottu Roti with Shredded Leeks & Carrots',
-    sriLankanDishType: 'Sri Lankan Famous Street Food / Short Eats',
-    foodItems: [
-      { name: 'Chopped Godamba Roti', estimatedPortion: '1 plate (~180g)', estimatedPortionGrams: 180, calories: 340, matchedCategory: 'bread', calibratedCalories: 340 },
-      { name: 'Scrambled Farm Eggs', estimatedPortion: '2 eggs (~100g)', estimatedPortionGrams: 100, calories: 155, matchedCategory: 'egg', calibratedCalories: 155 },
-      { name: 'Stir-Fried Leeks, Carrots & Cabbage', estimatedPortion: '1 cup (~120g)', estimatedPortionGrams: 120, calories: 65, matchedCategory: 'salad', calibratedCalories: 65 },
-      { name: 'Spicy Curry Sauce & Green Chillies', estimatedPortion: '1 ladle (~80g)', estimatedPortionGrams: 80, calories: 85, matchedCategory: 'curry', calibratedCalories: 85 },
-    ],
-    totalCalories: 645,
-    macros: { proteinGrams: 28, carbsGrams: 76, fatGrams: 24 },
-    condition: 'Freshly stir-fried hot on iron griddle with rich spices and moderate cooking oil',
-    healthRating: 'MODERATE',
-    healthScore: 68,
-    healthVerdict: 'Moderate Balance (Tasty Energy — High Glycemic Carb Density)',
-    habitImpactStatus: 'MODERATE_FOR_HABITS',
-    habitImpactReason: 'Good in moderation! Has higher carb density from Godamba roti. Drink an extra glass of water (+400ml) to balance sodium, and consider an active walking session afterwards.',
-    healthTip: 'Adding extra vegetables (like leeks and carrots) boosts fiber content and slows down carbohydrate breakdown.',
-    confidence: 0.93,
-    calibrationNote: 'Calibrated with LifeSync Vision Model (Sri Lankan Botanical Reference).',
-  },
-  {
-    isFood: true,
-    mealTitle: 'Sri Lankan String Hoppers (Idiyappam) with Kiri Hodi & Spicy Pol Sambol',
-    sriLankanDishType: 'Traditional Sri Lankan Breakfast & Dinner Staple',
-    foodItems: [
-      { name: 'Steamed Red Rice String Hoppers', estimatedPortion: '10 nests (~180g)', estimatedPortionGrams: 180, calories: 230, matchedCategory: 'hoppers', calibratedCalories: 230 },
-      { name: 'Coconut Milk Kiri Hodi with Turmeric & Fenugreek', estimatedPortion: '1 cup (~150g)', estimatedPortionGrams: 150, calories: 140, matchedCategory: 'curry', calibratedCalories: 140 },
-      { name: 'Spicy Fresh Coconut Pol Sambol', estimatedPortion: '2 tbsp (~40g)', estimatedPortionGrams: 40, calories: 120, matchedCategory: 'salad', calibratedCalories: 120 },
-    ],
-    totalCalories: 490,
-    macros: { proteinGrams: 14, carbsGrams: 68, fatGrams: 18 },
-    condition: 'Freshly steamed red string hoppers with aromatic coconut fenugreek gravy',
-    healthRating: 'GOOD',
-    healthScore: 84,
-    healthVerdict: 'Wholesome Light Meal (Optimal with Red Rice String Hoppers)',
-    habitImpactStatus: 'GOOD_FOR_HABITS',
-    habitImpactReason: 'Light, easily digestible, and gentle on the stomach. Red rice string hoppers provide clean energy without heaviness.',
-    healthTip: 'Choose red rice string hoppers over white flour versions for higher dietary fiber and lower glycemic impact.',
-    confidence: 0.95,
-    calibrationNote: 'Calibrated with LifeSync Vision Model (Sri Lankan Botanical Reference).',
-  },
-  {
-    isFood: true,
-    mealTitle: 'Mediterranean Quinoa & Grilled Chicken Breast Bowl',
-    sriLankanDishType: 'High-Protein Fitness Bowl',
-    foodItems: [
-      { name: 'Grilled Herb Chicken Breast', estimatedPortion: '1 fillet (~180g)', estimatedPortionGrams: 180, calories: 297, matchedCategory: 'chicken', calibratedCalories: 297 },
-      { name: 'Steamed Tri-Color Quinoa & Brown Rice', estimatedPortion: '1 cup (~150g)', estimatedPortionGrams: 150, calories: 195, matchedCategory: 'rice', calibratedCalories: 195 },
-      { name: 'Fresh Garden Salad & Cold-Pressed Olive Oil', estimatedPortion: '1 bowl (~100g)', estimatedPortionGrams: 100, calories: 65, matchedCategory: 'salad', calibratedCalories: 65 },
-    ],
-    totalCalories: 557,
-    macros: { proteinGrams: 46, carbsGrams: 52, fatGrams: 14 },
-    condition: 'Fresh, nutrient-dense whole meal with optimal protein density',
-    healthRating: 'GOOD',
-    healthScore: 94,
-    healthVerdict: 'Healthy & High Nutrition Quality (Optimal for daily fitness goals)',
-    habitImpactStatus: 'EXCELLENT_FOR_HABITS',
-    habitImpactReason: 'Ideal post-workout meal! 46g high-purity protein aids muscle repair and maintains fitness streak consistency.',
-    healthTip: 'Great balanced meal! The complex carbohydrates provide sustained energy while high protein aids muscle recovery.',
-    confidence: 0.94,
-    calibrationNote: 'Calibrated with LifeSync Intelligent Vision Engine.',
-  },
-  {
-    isFood: true,
-    mealTitle: 'Double Cheeseburger & Seasoned Salted Fries',
-    sriLankanDishType: 'Fast Food / High Calorie Density',
-    foodItems: [
-      { name: 'Crispy Double Cheeseburger', estimatedPortion: '1 burger (~240g)', estimatedPortionGrams: 240, calories: 680, matchedCategory: 'burger', calibratedCalories: 680 },
-      { name: 'Salted French Fries', estimatedPortion: '1 regular box (~140g)', estimatedPortionGrams: 140, calories: 380, matchedCategory: 'fries', calibratedCalories: 380 },
-    ],
-    totalCalories: 1060,
-    macros: { proteinGrams: 32, carbsGrams: 98, fatGrams: 58 },
-    condition: 'High in sodium, refined carbohydrates and saturated fat',
-    healthRating: 'BAD',
-    healthScore: 36,
-    healthVerdict: 'High Calorie & Saturated Fat Density (Limit intake)',
-    habitImpactStatus: 'POOR_FOR_HABITS',
-    habitImpactReason: 'Can cause sluggishness and lethargy. High sodium triggers dehydration — make sure to drink at least 500ml water to protect hydration habits.',
-    healthTip: 'Consider drinking plenty of water and pairing your next meal with high-fiber leafy greens to aid digestion.',
-    confidence: 0.93,
-    calibrationNote: 'Calibrated with LifeSync Intelligent Vision Engine.',
-  },
-];
 
 async function callDirectGeminiVision(base64: string, mimeType: string): Promise<FoodAnalysis | null> {
-  const geminiKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY || process.env.EXPO_PUBLIC_FIREBASE_API_KEY;
+  // Previously fell back to EXPO_PUBLIC_FIREBASE_API_KEY, which is not a Gemini credential — that
+  // sent a request guaranteed to 400 instead of cleanly reporting "no key configured".
+  const geminiKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
   if (!geminiKey) return null;
 
   const promptText = `You are an expert AI food scientist, certified nutritionist, and botanical vision specialist inside LifeSync.
@@ -450,39 +328,51 @@ Respond ONLY with a valid raw JSON object matching the fields above.`;
     }
   };
 
-  try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+  /**
+   * Model order matters. gemini-2.5-flash was retired for new API keys — it now returns
+   * 404 "no longer available to new users" — so the current model is tried first and older
+   * names are kept only as fallbacks for keys provisioned before the cutover.
+   */
+  const MODELS = ['gemini-3.6-flash', 'gemini-flash-latest', 'gemini-2.5-flash'];
 
-    if (res.ok) {
-      const data = await res.json();
-      const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (rawText) {
-        return JSON.parse(rawText) as FoodAnalysis;
-      }
-    } else {
-      // Try gemini-1.5-flash fallback if 2.5 is unavailable
-      const fallbackUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`;
-      const res2 = await fetch(fallbackUrl, {
+  for (const model of MODELS) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+      const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
-      if (res2.ok) {
-        const data2 = await res2.json();
-        const rawText2 = data2?.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (rawText2) {
-          return JSON.parse(rawText2) as FoodAnalysis;
-        }
+
+      if (!res.ok) {
+        const detail = await res.text().catch(() => '');
+        console.warn(`[gemini] ${model} -> HTTP ${res.status}`, detail.slice(0, 200));
+        continue;
       }
+
+      const data = await res.json();
+      const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!rawText) {
+        console.warn(`[gemini] ${model} returned no text part`);
+        continue;
+      }
+
+      // The model is asked for raw JSON, but wrapping it in a ```json fence is a common
+      // deviation — strip that before parsing rather than failing the whole scan.
+      const cleaned = rawText.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+      try {
+        return normalizeAnalysis(JSON.parse(cleaned));
+      } catch {
+        console.warn(`[gemini] ${model} returned unparseable JSON:`, cleaned.slice(0, 200));
+        continue;
+      }
+    } catch (err) {
+      console.warn(`[gemini] ${model} request failed:`, err);
     }
-  } catch (err) {
-    console.warn('Direct Gemini Vision fetch error:', err);
   }
+
+  // Every model was tried and none produced usable JSON — the caller falls through to the
+  // Cloud Function, then to the clearly-labelled example meal.
   return null;
 }
 
@@ -498,11 +388,13 @@ export async function analyzeFoodPhoto(base64: string, mimeType: string, imageUr
     console.warn('Direct Gemini Vision skipped:', e);
   }
 
-  // 2. Try Firebase Cloud Function callable with timeout
+  // 2. Try the Firebase Cloud Function callable. This is the production path — the one where the
+  //    Gemini key lives server-side — but it only exists once `firebase deploy` has been run, so
+  //    the timeout keeps an undeployed project from stalling the whole scan.
   try {
     const callPromise = analyzeFoodPhotoCallable({ imageBase64: base64, mimeType });
     const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('Cloud Function connection timeout')), 15000)
+      setTimeout(() => reject(new Error('Cloud Function connection timeout')), 8000)
     );
     const result = await Promise.race([callPromise, timeoutPromise]);
     if (result && result.data) {
@@ -510,59 +402,54 @@ export async function analyzeFoodPhoto(base64: string, mimeType: string, imageUr
       return { ...result.data, ...evalHealth, imageUri };
     }
   } catch (err) {
-    console.warn('Cloud Functions analyzeFoodPhoto unavailable, using intelligent vision engine:', err);
+    console.warn('[food] Cloud Function analyzeFoodPhoto unavailable:', err);
   }
 
-  // 3. Robust full-payload perceptual hashing across entire image byte stream
-  // This samples across start, middle, and end so different images never collide to the same dish
-  let hashVal = 17;
-  const len = base64.length;
-  const step = Math.max(1, Math.floor(len / 120));
-  for (let i = 0; i < len; i += step) {
-    hashVal = (hashVal * 37 + base64.charCodeAt(i)) % 2147483647;
-  }
-  hashVal = (hashVal + len) % 2147483647;
-
-  // Detect non-food objects if image has very low entropy or tiny size
-  if (len < 5000) {
-    return {
-      isFood: false,
-      nonFoodReason: 'Object detected does not appear to be edible food or beverage.',
-      mealTitle: 'Non-Food Item',
-      foodItems: [],
-      totalCalories: 0,
-      macros: { proteinGrams: 0, carbsGrams: 0, fatGrams: 0 },
-      condition: 'Non-edible object',
-      healthRating: 'BAD',
-      healthScore: 0,
-      healthVerdict: 'Non-food object detected. Please take a clear photo of your meal or drink.',
-      habitImpactStatus: 'POOR_FOR_HABITS',
-      habitImpactReason: 'Non-food objects cannot be logged into your nutrition habits.',
-      sriLankanDishType: 'Non-Food Object',
-      healthTip: 'Capture a close-up photo of your food plate or drink to calculate nutrition.',
-      confidence: 0.98,
-      imageUri,
-    };
-  }
-
-  const index = Math.abs(hashVal) % FALLBACK_MEALS.length;
-  const meal = FALLBACK_MEALS[index];
-  const evalHealth = evaluateFoodHealth(meal);
-  return { ...meal, ...evalHealth, imageUri, isFallback: true };
+  // Every analysis path failed. Previously this fell through to a meal picked by hashing the
+  // image bytes — a fabricated result presented alongside the user's own photo. Throwing instead
+  // lets FoodScanScreen surface a real error, which is the only honest outcome when the photo
+  // was never actually analysed.
+  throw new Error(
+    'Could not analyse this photo. Check your connection and try again — if it keeps failing, ' +
+      'the AI service may be unavailable right now.'
+  );
 }
 
 const foodLogsCollection = (uid: string) => collection(db, 'users', uid, 'foodLogs');
+
+/**
+ * Firestore rejects `undefined` field values outright — a single optional property that happens
+ * to be unset makes the whole addDoc throw. Several fields here are optional by design
+ * (imageUri, matchedCategory, calibratedCalories, nonFoodReason), so strip them rather than
+ * letting one absent value lose the user's meal.
+ */
+function stripUndefined<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map(stripUndefined) as unknown as T;
+  }
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (v !== undefined) out[k] = stripUndefined(v);
+    }
+    return out as T;
+  }
+  return value;
+}
 
 export function saveFoodLog(uid: string, analysis: FoodAnalysis, imageUri?: string) {
   const evalHealth = evaluateFoodHealth(analysis);
   const entry: Omit<FoodLog, 'id'> = {
     ...analysis,
     ...evalHealth,
+    // Note: this is the on-device file:// URI from the image picker, not an uploaded image.
+    // It renders on the phone that took the photo and nowhere else — showing the meal's photo
+    // on another device would need the file uploaded to Firebase Storage first.
     imageUri: imageUri || analysis.imageUri,
-    date: new Date().toISOString().slice(0, 10),
+    date: toDateKey(),
     createdAt: Date.now(),
   };
-  return addDoc(foodLogsCollection(uid), entry);
+  return addDoc(foodLogsCollection(uid), stripUndefined(entry));
 }
 
 export function subscribeToFoodLogs(uid: string, onChange: (logs: FoodLog[]) => void) {

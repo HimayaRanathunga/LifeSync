@@ -6,6 +6,7 @@ import {
   StyleSheet,
   Pressable,
   ActivityIndicator,
+  Alert,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -15,7 +16,8 @@ import { db } from '../../config/firebase';
 import { useAuth } from '../../context/AuthContext';
 import { useTheme } from '../../context/ThemeContext';
 import Logo from '../../components/Logo';
-import type { UserProfile, DailyGoals } from '../../types';
+import type { UserProfile, DailyGoals, Goal } from '../../types';
+import GoalPicker from '../../components/GoalPicker';
 
 function format12h(timeStr: string): string {
   const [hStr, mStr] = (timeStr || '07:00').split(':');
@@ -60,6 +62,13 @@ export default function OnboardingScreen({ navigation }: any) {
   const [calories, setCalories] = useState(2000);
   const [water, setWater] = useState(2500);
   const [steps, setSteps] = useState(8000);
+  // Population medians, used only as a sane starting position for the steppers — the value
+  // actually saved is whatever the user leaves them on.
+  const [heightCm, setHeightCm] = useState(170);
+  const [weightKg, setWeightKg] = useState(70);
+  // Previously hardcoded to ['fitness','study'] for every user, which made the field useless for
+  // personalisation. GoalPicker already existed in src/components but was wired to nothing.
+  const [selectedGoals, setSelectedGoals] = useState<Goal[]>(['fitness']);
 
   const [saving, setSaving] = useState(false);
 
@@ -77,29 +86,45 @@ export default function OnboardingScreen({ navigation }: any) {
 
         const profile: UserProfile = {
           uid: user.uid,
-          displayName: user.email?.split('@')[0] ?? 'himaya16',
+          displayName: user.email?.split('@')[0] ?? 'User',
           email: user.email ?? '',
           wakeTime,
           workStart,
           workEnd,
-          goals: ['fitness', 'study'],
+          goals: selectedGoals,
           dailyGoals,
+          heightCm,
+          weightKg,
           createdAt: Date.now(),
         };
 
-        // Fire-and-forget background write so network latency never blocks navigation
-        setDoc(doc(db, 'users', user.uid), profile, { merge: true }).catch((err) => {
-          console.warn('Background profile save error:', err);
-        });
+        // Awaited, not fire-and-forget: this is the only write that creates the user's profile,
+        // and every screen afterwards reads from it. A silent failure here left the account with
+        // no profile document at all, with nothing shown to the user to explain why.
+        await setDoc(doc(db, 'users', user.uid), profile, { merge: true });
       }
-    } catch (err) {
-      console.warn('Profile save warning:', err);
-    }
 
-    // Instantly transition to Main Dashboard
-    setTimeout(() => {
       navigation.replace('MainTabs');
-    }, 150);
+    } catch (err: any) {
+      console.warn('[onboarding] profile save failed:', err?.code, err?.message);
+      Alert.alert(
+        'Could not save your profile',
+        err?.code === 'permission-denied'
+          ? 'The database rejected the write. Firestore security rules may not be deployed yet.'
+          : 'Check your connection and try again.',
+        [
+          { text: 'Retry', onPress: () => setSaving(false) },
+          {
+            text: 'Continue anyway',
+            style: 'cancel',
+            onPress: () => navigation.replace('MainTabs'),
+          },
+        ]
+      );
+      return;
+    } finally {
+      setSaving(false);
+    }
   };
 
   const styles = useMemo(
@@ -473,6 +498,48 @@ export default function OnboardingScreen({ navigation }: any) {
                   <Ionicons name="add" size={18} color={isDark ? '#FFFFFF' : '#0F172A'} />
                 </Pressable>
               </View>
+            </View>
+
+            {/* Height and weight are asked once here rather than on the buried food-detail
+                screen, because the Dashboard needs them for its distance and active-burn
+                estimates and the Health screen needs them for BMI. Both are optional — every
+                consumer already renders "—" when they are absent. */}
+            <View style={styles.card}>
+              <View style={styles.cardTitleRow}>
+                <Ionicons name="body-outline" size={18} color="#0EA5E9" />
+                <Text style={styles.cardTitle}>Height (cm)</Text>
+              </View>
+
+              <View style={styles.stepperWrapper}>
+                <Pressable style={styles.stepBtn} onPress={() => setHeightCm((h) => Math.max(120, h - 1))}>
+                  <Ionicons name="remove" size={18} color={isDark ? '#FFFFFF' : '#0F172A'} />
+                </Pressable>
+                <Text style={styles.stepperValue}>{heightCm}</Text>
+                <Pressable style={styles.stepBtn} onPress={() => setHeightCm((h) => Math.min(220, h + 1))}>
+                  <Ionicons name="add" size={18} color={isDark ? '#FFFFFF' : '#0F172A'} />
+                </Pressable>
+              </View>
+            </View>
+
+            <View style={styles.card}>
+              <View style={styles.cardTitleRow}>
+                <Ionicons name="fitness-outline" size={18} color="#F59E0B" />
+                <Text style={styles.cardTitle}>Weight (kg)</Text>
+              </View>
+
+              <View style={styles.stepperWrapper}>
+                <Pressable style={styles.stepBtn} onPress={() => setWeightKg((w) => Math.max(30, w - 1))}>
+                  <Ionicons name="remove" size={18} color={isDark ? '#FFFFFF' : '#0F172A'} />
+                </Pressable>
+                <Text style={styles.stepperValue}>{weightKg}</Text>
+                <Pressable style={styles.stepBtn} onPress={() => setWeightKg((w) => Math.min(250, w + 1))}>
+                  <Ionicons name="add" size={18} color={isDark ? '#FFFFFF' : '#0F172A'} />
+                </Pressable>
+              </View>
+            </View>
+
+            <View style={styles.card}>
+              <GoalPicker value={selectedGoals} onChange={setSelectedGoals} />
             </View>
 
             <Pressable style={styles.actionBtn} onPress={() => setStep(3)}>

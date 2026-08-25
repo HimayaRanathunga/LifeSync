@@ -29,8 +29,14 @@ import { subscribeToTodayFoodLogs } from '../../services/foodService';
 import { subscribeToTodayHealthLog } from '../../services/logsService';
 import { exportUserData, exportUserDataAsPdf, deleteUserAccount } from '../../services/exportService';
 import { useTodaySteps } from '../../hooks/useTodaySteps';
+import {
+  ensureNotificationSetup,
+  disableHabitReminders,
+  getScheduledReminderCount,
+} from '../../services/notificationsService';
 import { DEFAULT_DAILY_GOALS } from '../../constants/goals';
 import type { DailyGoals, FoodLog, HealthLog } from '../../types';
+import { toDateKey } from '../../utils/dates';
 
 function getTimeGreeting(): { greeting: string; icon: keyof typeof Ionicons.glyphMap } {
   const hour = new Date().getHours();
@@ -56,7 +62,7 @@ export default function SettingsScreen() {
   const { user, logOut } = useAuth();
   const { scheme, setScheme, isDark } = useTheme();
   const insets = useSafeAreaInsets();
-  const today = new Date().toISOString().slice(0, 10);
+  const today = toDateKey();
 
   const [displayName, setDisplayName] = useState('');
   const [avatarUri, setAvatarUri] = useState<string | null>(null);
@@ -71,6 +77,10 @@ export default function SettingsScreen() {
   const [stepTarget, setStepTarget] = useState(String(DEFAULT_DAILY_GOALS.stepTarget));
   const [showSettingsDrawer, setShowSettingsDrawer] = useState(false);
   const [notificationsEnabled, setNotificationsEnabled] = useState(true);
+  // Read back from the OS rather than inferred from the flag: the switch can be on while the
+  // system has nothing scheduled (permission revoked outside the app, no habits yet), and showing
+  // the real count keeps the row from claiming something untrue.
+  const [scheduledCount, setScheduledCount] = useState<number | null>(null);
   const [goalsSaved, setGoalsSaved] = useState(false);
 
   // Edit Profile Modal
@@ -111,6 +121,10 @@ export default function SettingsScreen() {
       }
       if (p.notificationsEnabled !== undefined) setNotificationsEnabled(p.notificationsEnabled);
     });
+
+    getScheduledReminderCount()
+      .then(setScheduledCount)
+      .catch(() => setScheduledCount(0));
 
     const unsubFood = subscribeToTodayFoodLogs(user.uid, today, setTodayFoodLogs);
     const unsubHealth = subscribeToTodayHealthLog(user.uid, today, setTodayHealthLog);
@@ -180,10 +194,36 @@ export default function SettingsScreen() {
     setTimeout(() => setGoalsSaved(false), 2500);
   };
 
+  /**
+   * The switch previously only wrote a Firestore flag that nothing read, so turning notifications
+   * off cancelled nothing. It now actually clears the OS-scheduled reminders, and turning it back
+   * on asks for permission — if the user declines, the switch reverts rather than sitting in a
+   * state the system will not honour.
+   */
   const handleToggleNotifications = async (val: boolean) => {
     if (!user) return;
     setNotificationsEnabled(val);
-    await updateNotificationsEnabled(user.uid, val);
+
+    try {
+      if (val) {
+        const granted = await ensureNotificationSetup();
+        if (!granted) {
+          setNotificationsEnabled(false);
+          Alert.alert(
+            'Notifications blocked',
+            'Reminders need notification permission. Enable it for LifeSync in your device settings, then try again.'
+          );
+          return;
+        }
+        // The Dashboard re-schedules from the model's current suggestions once this flag flips.
+      } else {
+        await disableHabitReminders();
+      }
+      await updateNotificationsEnabled(user.uid, val);
+    } catch (err: any) {
+      setNotificationsEnabled(!val);
+      Alert.alert('Could not update notifications', err?.message ?? 'Please try again.');
+    }
   };
 
   const handleExport = async () => {
@@ -818,8 +858,20 @@ export default function SettingsScreen() {
               <Text style={{ fontSize: 13, fontWeight: '700', color: isDark ? '#F8FAFC' : '#0F172A' }}>
                 Push Notifications
               </Text>
-              <Switch value={notificationsEnabled} onValueChange={handleToggleNotifications} />
+              <Switch
+                value={notificationsEnabled}
+                onValueChange={handleToggleNotifications}
+                accessibilityLabel="Habit reminder notifications"
+              />
             </View>
+
+            <Text style={{ fontSize: 11, color: isDark ? '#94A3B8' : '#64748B', marginTop: -6, marginBottom: 6 }}>
+              {scheduledCount === null
+                ? '—'
+                : scheduledCount === 0
+                  ? 'No reminders scheduled yet — add a habit to get one.'
+                  : `${scheduledCount} reminder${scheduledCount === 1 ? '' : 's'} scheduled from your habit times.`}
+            </Text>
 
             {/* Data Export & Logout */}
             <Pressable style={styles.outlineBtn} onPress={handleExport}>

@@ -7,6 +7,12 @@ import {
   subscribeToLiveSteps,
 } from '../services/stepsService';
 import { fetchHealthLog, incrementSteps } from '../services/logsService';
+import {
+  subscribeToLiveStepEstimate,
+  isAccelerometerAvailable,
+  type LiveStepSubscription,
+} from '../services/liveStepDetector';
+import { toDateKey } from '../utils/dates';
 
 // Avoids writing to Firestore on every single step on Android — only persists once the
 // unsaved delta crosses this many steps.
@@ -26,26 +32,65 @@ const ANDROID_PERSIST_STEP_THRESHOLD = 20;
  * across app opens. Real limitation: steps taken before the app was opened today, on a day the
  * app hasn't been opened yet, aren't counted — Health Connect would fix this but isn't wired up.
  *
- * Returns null while unavailable/permission-denied/loading, so callers can render "—".
+ * Reports the three states separately — 'loading', 'unavailable' (with the reason), and 'ready' —
+ * so a screen can distinguish "still fetching" from "this device has no pedometer" from a real
+ * zero. A step count of 0 is a truthful answer for a user who hasn't walked yet today; callers
+ * must not substitute a placeholder for it.
+ *
+ * Offline behaviour: the pedometer itself is a device sensor and needs no network, so live
+ * counting works offline. The Firestore round-trips do not: reads fall back to a baseline of 0
+ * (see below) and writes are queued in the SDK's in-memory buffer, which is lost if the app is
+ * killed before reconnecting. There is no persistent cache to fall back on — the JS SDK's
+ * persistentLocalCache() is IndexedDB-backed and therefore unavailable in React Native; real
+ * offline durability would need @react-native-firebase/firestore and a development build.
+ *
+ * Known gap, not fixed here: `today` is captured once when the effect runs, so a session left
+ * open past local midnight keeps attributing steps to the previous day's document.
  */
-export function useTodaySteps(uid: string | undefined): number | null {
-  const [steps, setSteps] = useState<number | null>(null);
+export type StepsState =
+  | { status: 'loading' }
+  | { status: 'unavailable'; reason: 'no-pedometer' | 'permission-denied' }
+  | { status: 'ready'; steps: number };
+
+export function useTodayStepsState(uid: string | undefined): StepsState {
+  const [state, setState] = useState<StepsState>({ status: 'loading' });
 
   useEffect(() => {
-    if (!uid) return;
+    if (!uid) {
+      setState({ status: 'loading' });
+      return;
+    }
     const currentUid = uid;
     let cancelled = false;
     let subscription: ReturnType<typeof subscribeToLiveSteps> | undefined;
-    const today = new Date().toISOString().slice(0, 10);
+    const today = toDateKey();
     let baseline = 0;
     let lastPersisted = 0;
+    let latestTotal = 0;
+    // Authoritative count from the hardware pedometer; the provisional accelerometer estimate is
+    // layered on top for display only and reset whenever the hardware reports.
+    let hardwareTotal = 0;
+    let provisionalSteps = 0;
+    let liveDetector: LiveStepSubscription | null = null;
+
+    setState({ status: 'loading' });
 
     async function init() {
       const available = await isPedometerAvailable();
-      if (!available || cancelled) return;
+      console.log('[steps] isAvailableAsync ->', available);
+      if (cancelled) return;
+      if (!available) {
+        setState({ status: 'unavailable', reason: 'no-pedometer' });
+        return;
+      }
 
       const granted = await requestStepsPermission();
-      if (!granted || cancelled) return;
+      console.log('[steps] permission granted ->', granted);
+      if (cancelled) return;
+      if (!granted) {
+        setState({ status: 'unavailable', reason: 'permission-denied' });
+        return;
+      }
 
       if (Platform.OS === 'ios') {
         try {
@@ -54,17 +99,39 @@ export function useTodaySteps(uid: string | undefined): number | null {
           baseline = 0;
         }
       } else {
-        const persisted = await fetchHealthLog(currentUid, today);
-        baseline = persisted?.steps ?? 0;
+        // Must not be left unguarded: the app has no persistent Firestore cache (the JS SDK's
+        // persistentLocalCache is IndexedDB-backed and unavailable in React Native), so this
+        // getDoc rejects with `unavailable` whenever the device is offline and today's document
+        // hasn't been read this session. Letting that reject would strand the hook in 'loading'
+        // and show "—" while the user is actually walking. A baseline of 0 is the honest
+        // fallback — the live delta below still counts this session's steps.
+        try {
+          const persisted = await fetchHealthLog(currentUid, today);
+          baseline = persisted?.steps ?? 0;
+        } catch {
+          baseline = 0;
+        }
       }
       if (cancelled) return;
 
       lastPersisted = baseline;
-      setSteps(baseline);
+      hardwareTotal = baseline;
+      console.log('[steps] baseline ->', baseline, '| platform', Platform.OS, '| date', today);
+      setState({ status: 'ready', steps: baseline });
 
       subscription = subscribeToLiveSteps((delta) => {
         const total = baseline + delta;
-        setSteps(total);
+        console.log('[steps] watchStepCount delta ->', delta, '| total', total);
+        hardwareTotal = total;
+        // The hardware has spoken — discard the provisional estimate rather than adding to it,
+        // so accelerometer error can never accumulate into the stored total.
+        provisionalSteps = 0;
+        liveDetector?.remove();
+        liveDetector = null;
+        startLiveDetector();
+
+        latestTotal = total;
+        setState({ status: 'ready', steps: total });
 
         if (Platform.OS === 'android' && total - lastPersisted >= ANDROID_PERSIST_STEP_THRESHOLD) {
           const toPersist = total - lastPersisted;
@@ -72,14 +139,48 @@ export function useTodaySteps(uid: string | undefined): number | null {
           incrementSteps(currentUid, today, toPersist).catch(() => {});
         }
       });
+
+      // Android's hardware counter batches, so without this the display sits still for the first
+      // 10-20 paces. The estimate is shown but never persisted — see liveStepDetector.ts.
+      if (Platform.OS === 'android' && (await isAccelerometerAvailable()) && !cancelled) {
+        startLiveDetector();
+      }
     }
 
-    init();
+    function startLiveDetector() {
+      if (Platform.OS !== 'android' || cancelled) return;
+      liveDetector = subscribeToLiveStepEstimate((detected) => {
+        provisionalSteps = detected;
+        setState({ status: 'ready', steps: hardwareTotal + provisionalSteps });
+      });
+    }
+
+    // A rejection anywhere in init() would otherwise surface as an unhandled promise rejection
+    // and leave the hook stuck in 'loading'.
+    init().catch(() => {
+      if (!cancelled) setState({ status: 'unavailable', reason: 'no-pedometer' });
+    });
+
     return () => {
       cancelled = true;
       subscription?.remove();
+      liveDetector?.remove();
+      // Flush whatever hasn't crossed the batching threshold, so a short walk before the screen
+      // closes isn't silently dropped.
+      if (Platform.OS === 'android' && latestTotal > lastPersisted) {
+        incrementSteps(currentUid, today, latestTotal - lastPersisted).catch(() => {});
+      }
     };
   }, [uid]);
 
-  return steps;
+  return state;
+}
+
+/**
+ * Convenience wrapper for callers that only need the number. Returns null for every non-ready
+ * state — prefer useTodayStepsState when the UI should explain *why* there is no value.
+ */
+export function useTodaySteps(uid: string | undefined): number | null {
+  const state = useTodayStepsState(uid);
+  return state.status === 'ready' ? state.steps : null;
 }

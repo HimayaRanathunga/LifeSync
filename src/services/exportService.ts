@@ -16,6 +16,7 @@ import { fetchAllFoodLogs, deleteAllFoodLogs, fetchRecentFoodLogs } from './food
 import { fetchAllRecommendations } from './recommendationsService';
 import { computeFoodPredictionAccuracy, computeHabitPredictionAccuracy } from './accuracyService';
 import type { UserProfile } from '../types';
+import { toDateKey } from '../utils/dates';
 
 // The "daily routine" window the app currently seeds/tracks in detail — keeps the exported
 // routine data scoped to the same recent period rather than a user's entire habit history.
@@ -24,7 +25,7 @@ const ROUTINE_WINDOW_DAYS = 21;
 function dateNDaysAgo(n: number): string {
   const d = new Date();
   d.setDate(d.getDate() - n);
-  return d.toISOString().slice(0, 10);
+  return toDateKey(d);
 }
 
 /** Bundles everything the user has stored into one JSON blob and hands it to the OS share sheet (save/email/etc). */

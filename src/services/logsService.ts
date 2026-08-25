@@ -17,14 +17,27 @@ import {
   type DocumentData,
   type Unsubscribe,
 } from 'firebase/firestore';
+import { enqueue, dequeue, flushPending, type HealthField } from './offlineQueue';
 import { db } from '../config/firebase';
 import type { HabitLog, HealthLog } from '../types';
 
 const logsCollection = (uid: string) => collection(db, 'users', uid, 'logs');
 const healthCollection = (uid: string) => collection(db, 'users', uid, 'healthLogs');
 
+/**
+ * One document per habit per day, keyed deterministically.
+ *
+ * This previously used addDoc, so toggling a habit off and back on wrote a second document for
+ * the same habit-day. That made the rendered tick depend on snapshot ordering (auto-IDs are
+ * random, not monotonic), duplicated rows in the history list, and — worse — inflated the
+ * attempt count the recommendation engine reads: `logs.length` crossing MIN_SAMPLES_FOR_ML early
+ * on duplicates, and the same attempt counted twice in computeHourlySuccessRates.
+ *
+ * The key order matches the seeder (functions/src/seed/seedDatabase.ts) so seeded and
+ * app-written rows resolve to the same document rather than fighting over the day.
+ */
 export function logHabitCompletion(uid: string, entry: Omit<HabitLog, 'id'>) {
-  return addDoc(logsCollection(uid), entry);
+  return setDoc(doc(logsCollection(uid), `${entry.habitId}_${entry.date}`), entry);
 }
 
 export function subscribeToHabitLogs(uid: string, onChange: (logs: HabitLog[]) => void) {
@@ -43,14 +56,39 @@ export function upsertHealthLog(uid: string, date: string, entry: Partial<Omit<H
   return setDoc(doc(healthCollection(uid), date), { date, ...entry }, { merge: true });
 }
 
+/** The bare Firestore write, with no durability log — used by the offline replay path itself. */
+function applyHealthIncrement(uid: string, date: string, field: HealthField, amount: number) {
+  return setDoc(doc(healthCollection(uid), date), { date, [field]: increment(amount) }, { merge: true });
+}
+
+/**
+ * Records the increment in the durable write-ahead log before sending it, then clears the log
+ * entry once the server confirms. An offline `setDoc` never rejects — it stays pending — so
+ * without this an increment made offline is lost silently if the app is killed before it syncs.
+ * See services/offlineQueue.ts.
+ */
+async function loggedIncrement(uid: string, date: string, field: HealthField, amount: number) {
+  const entryId = await enqueue(uid, date, field, amount);
+  await applyHealthIncrement(uid, date, field, amount);
+  await dequeue(entryId);
+}
+
 /** Atomic +amountMl to today's water total (quick-add buttons) — creates today's doc if absent. */
 export function incrementWaterMl(uid: string, date: string, amountMl: number) {
-  return setDoc(doc(healthCollection(uid), date), { date, waterMl: increment(amountMl) }, { merge: true });
+  return loggedIncrement(uid, date, 'waterMl', amountMl);
 }
 
 /** Atomic step-count accumulation — used on Android, where there's no device-side daily total. */
 export function incrementSteps(uid: string, date: string, amount: number) {
-  return setDoc(doc(healthCollection(uid), date), { date, steps: increment(amount) }, { merge: true });
+  return loggedIncrement(uid, date, 'steps', amount);
+}
+
+/**
+ * Replays any health increments that were recorded locally but never confirmed by the server —
+ * call on sign-in and whenever the app returns to the foreground.
+ */
+export function syncPendingHealthWrites(uid: string): Promise<number> {
+  return flushPending(uid, (date, field, amount) => applyHealthIncrement(uid, date, field, amount));
 }
 
 /** One-shot read of a single day's health doc — used as the Android step-count baseline (see useTodaySteps). */

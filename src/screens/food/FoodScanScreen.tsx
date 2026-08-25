@@ -19,6 +19,7 @@ import { useTheme } from '../../context/ThemeContext';
 import { prepareImageForUpload } from '../../services/imageUtils';
 import { analyzeFoodPhoto, saveFoodLog, subscribeToFoodLogs } from '../../services/foodService';
 import type { FoodAnalysis, FoodLog } from '../../types';
+import { toDateKey } from '../../utils/dates';
 
 const MEAL_TYPES = [
   { id: 'm1', label: 'Breakfast', icon: 'cafe-outline', tag: 'Morning Fuel' },
@@ -28,12 +29,21 @@ const MEAL_TYPES = [
   { id: 'm5', label: 'Evening Snack', icon: 'leaf-outline', tag: 'Little Meal 2' },
 ];
 
-const CATEGORY_CHIPS = [
-  { id: 'c1', label: 'Vegetables', icon: 'leaf-outline' as const },
-  { id: 'c2', label: 'Protein', icon: 'egg-outline' as const },
-  { id: 'c3', label: 'Fruits', icon: 'nutrition-outline' as const },
-  { id: 'c4', label: 'Sri Lankan Greens', icon: 'flower-outline' as const },
-];
+/**
+ * Picks the meal slot that matches the current local hour, so opening the scanner at 23:00 does
+ * not default to "Breakfast". The user can still override it from the dropdown — this only sets
+ * the starting value.
+ */
+function mealTypeForHour(hour: number): string {
+  if (hour < 5) return 'Evening Snack'; // late night still belongs to the previous evening
+  if (hour < 10) return 'Breakfast';
+  if (hour < 12) return 'Morning Snack';
+  if (hour < 15) return 'Lunch';
+  if (hour < 18) return 'Evening Snack';
+  if (hour < 22) return 'Dinner';
+  return 'Evening Snack';
+}
+
 
 // Shown before any photo has been scanned this session — a genuine empty state, not a fake
 // canned example, so the screen doesn't look like it already has (stale) results on open.
@@ -54,8 +64,11 @@ export default function FoodScanScreen() {
   const insets = useSafeAreaInsets();
   const navigation = useNavigation<any>();
 
-  // Meal Type Dropdown State
-  const [selectedMealType, setSelectedMealType] = useState('Breakfast');
+  // Meal Type Dropdown State — seeded from the clock rather than always starting at Breakfast.
+  // Lazy initialiser so the hour is read once on mount, not on every render.
+  const [selectedMealType, setSelectedMealType] = useState(() =>
+    mealTypeForHour(new Date().getHours())
+  );
   const [showMealTypeDropdown, setShowMealTypeDropdown] = useState(false);
 
   const [photoUri, setPhotoUri] = useState<string | null>(null);
@@ -140,7 +153,7 @@ export default function FoodScanScreen() {
     setOptimisticLog({
       ...analysis,
       id: 'optimistic',
-      date: new Date().toISOString().slice(0, 10),
+      date: toDateKey(),
       createdAt: Date.now(),
       imageUri: photoUri || analysis.imageUri,
     });
@@ -345,27 +358,6 @@ export default function FoodScanScreen() {
           fontWeight: '800',
           color: '#2563EB',
         },
-        categoryScroll: {
-          flexDirection: 'row',
-          gap: 8,
-          marginBottom: 16,
-        },
-        catPill: {
-          flexDirection: 'row',
-          alignItems: 'center',
-          gap: 6,
-          backgroundColor: isDark ? '#1E293B' : '#F8FAFC',
-          paddingHorizontal: 14,
-          paddingVertical: 9,
-          borderRadius: 16,
-          borderWidth: 1,
-          borderColor: isDark ? '#334155' : '#E2E8F0',
-        },
-        catPillText: {
-          fontSize: 12,
-          fontWeight: '700',
-          color: isDark ? '#F8FAFC' : '#0F172A',
-        },
 
         // AI Suggest Card Box
         aiSuggestCard: {
@@ -510,16 +502,7 @@ export default function FoodScanScreen() {
           </View>
         ) : null}
 
-        {/* Fallback Warning Banner — shown when the AI analysis failed and an example meal is displayed instead */}
-        {currentMeal.isFallback ? (
-          <View style={{ backgroundColor: '#FEF3C7', padding: 12, borderRadius: 14, marginBottom: 12, flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-            <Ionicons name="warning" size={16} color="#92400E" />
-            <Text style={{ color: '#92400E', fontSize: 12, fontWeight: '800', textAlign: 'center', flex: 1 }}>
-              Couldn't analyze this photo right now — showing an example meal instead. Try again or edit the details before saving.
-            </Text>
-          </View>
-        ) : null}
-
+        
         {/* Center-Aligned Meal Summary Header Box */}
         <View style={styles.mealHeaderBox}>
           <View style={styles.mealHeaderTitleRow}>
@@ -579,26 +562,22 @@ export default function FoodScanScreen() {
           </Pressable>
         </View>
 
-        {/* Category Strip Section with See All -> Health Benefits Link */}
-        <View style={styles.sectionHeaderRow}>
-          <Text style={styles.sectionTitle}>Morning Delight</Text>
-          <Pressable
-            style={styles.seeAllBtn}
-            onPress={() => navigation.navigate('FoodHealthDetail')}
-          >
-            <Text style={styles.seeAllText}>Health Benefits</Text>
+        {/* The "Morning Delight" heading and its category chips were removed: the chips were a
+            static decorative list with no data behind them, and the heading claimed a meal slot
+            regardless of the time of day. The link is kept because FoodHealthDetail is where
+            height and weight are entered, and the Dashboard only offers a route to it while those
+            values are still missing — dropping this would strand the screen once they are set. */}
+        <Pressable
+          style={styles.sectionHeaderRow}
+          onPress={() => navigation.navigate('FoodHealthDetail')}
+          accessibilityRole="button"
+        >
+          <Text style={styles.sectionTitle}>Health Benefits & BMI</Text>
+          <View style={styles.seeAllBtn}>
+            <Text style={styles.seeAllText}>Open</Text>
             <Ionicons name="arrow-forward" size={12} color="#2563EB" />
-          </Pressable>
-        </View>
-
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.categoryScroll}>
-          {CATEGORY_CHIPS.map((c) => (
-            <View key={c.id} style={styles.catPill}>
-              <Ionicons name={c.icon} size={14} color="#16A34A" />
-              <Text style={styles.catPillText}>{c.label}</Text>
-            </View>
-          ))}
-        </ScrollView>
+          </View>
+        </Pressable>
 
         {/* AI Suggest / Health Tip Card */}
         <View style={styles.aiSuggestCard}>
