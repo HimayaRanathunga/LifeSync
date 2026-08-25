@@ -2,6 +2,8 @@
 
 # dependencies
 node_modules/
+functions/node_modules/
+functions/lib/
 
 # Expo
 .expo/
@@ -25,12 +27,16 @@ expo-env.d.ts
 npm-debug.*
 yarn-debug.*
 yarn-error.*
+firebase-debug.log
+firestore-debug.log
+*-debug.log
 
 # macOS
 .DS_Store
 *.pem
 
 # local env files
+.env
 .env*.local
 
 # typescript

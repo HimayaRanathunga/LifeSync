@@ -1,0 +1,29 @@
+flowchart TB
+    subgraph Client["Mobile Client — Expo / React Native (TypeScript)"]
+        UI["Screens: Auth, Onboarding, Dashboard,\nHabits, Health, Food Scan, Settings"]
+        Services["Service layer: authService, habitsService,\nlogsService, foodService, notificationsService"]
+        Sensors["Device APIs: expo-sensors (pedometer),\nexpo-location, expo-notifications,\nexpo-image-picker/manipulator"]
+    end
+
+    subgraph Firebase["Firebase (Backend-as-a-Service)"]
+        Auth["Firebase Authentication\n(email/password)"]
+        Firestore[("Cloud Firestore\nusers/{uid}/...")]
+        Functions["Cloud Functions v2 (TypeScript)\nrecommendation engine, ML inference,\nfood photo analysis"]
+        Rules["Firestore Security Rules\nper-user isolation"]
+    end
+
+    subgraph External["External Services"]
+        Gemini["Google Gemini API\n(gemini-2.5-flash, vision)"]
+        Weather["Weather API"]
+    end
+
+    UI --> Services
+    Services --> Sensors
+    Services -->|"reads/writes"| Firestore
+    Services -->|"auth"| Auth
+    Services -->|"callable functions"| Functions
+    Firestore -. enforced by .-> Rules
+    Functions -->|"food photo"| Gemini
+    Functions -->|"context data"| Weather
+    Functions -->|"server-write only"| Firestore
+    Functions -->|"push"| UI

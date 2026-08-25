@@ -1,0 +1,20 @@
+sequenceDiagram
+    actor U as User
+    participant App as Mobile Client
+    participant Img as imageUtils (resize/compress)
+    participant Fn as Cloud Function\n(analyzeFoodPhoto)
+    participant Gem as Gemini Vision API
+    participant Cal as Calorie Calibration Model\n(linear regression)
+    participant Fs as Firestore
+
+    U->>App: Capture / pick food photo
+    App->>Img: Resize & compress (max 1024px)
+    Img->>App: Compressed image
+    App->>Fn: Call analyzeFoodPhoto(image)
+    Fn->>Gem: Send photo + structured response schema
+    Gem-->>Fn: Items, calories, macros,\nfreshness, health tip
+    Fn->>Cal: Cross-check estimated calories\n(if item matches reference table)
+    Cal-->>Fn: Calibration note (or none)
+    Fn->>Fs: Save result to users/{uid}/foodLogs
+    Fn-->>App: Return analysis result
+    App-->>U: Display calories, macros,\ncondition, health tip

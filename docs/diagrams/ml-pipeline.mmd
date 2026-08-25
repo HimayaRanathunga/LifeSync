@@ -1,0 +1,15 @@
+flowchart LR
+    A["Synthetic training data\n(250 simulated users x 30 days)\nsyntheticData.ts"] --> B["Feature engineering\n7 features: hour sin/cos, weekend,\nhistorical success rate, sleep,\nstreak, habit age"]
+    B --> C["Mini-batch gradient descent\nlogistic regression (L2 reg)\nlogisticRegression.ts"]
+    C --> D["Compiled weights\nweights.generated.ts"]
+    D --> E{"Habit has >= 5\nlogged completions?"}
+    E -->|"No — cold start"| F["Rule-based weighted-average\nrecommendationEngine.ts"]
+    E -->|"Yes"| G["Trained model inference\nmlRecommender.ts\nscans 06:00-22:00"]
+    F --> H["Recommended time slot\nwritten to Firestore"]
+    G --> H
+    H --> I["Adaptive notification\nre-synced via expo-notifications"]
+
+    subgraph Evaluation["Offline evaluation"]
+        J["Validation accuracy: 68.0%\nvs 65.0% majority-class baseline"]
+    end
+    C -.-> J

@@ -1,0 +1,39 @@
+erDiagram
+    USERS ||--o{ HABITS : owns
+    USERS ||--o{ HEALTH_LOGS : owns
+    USERS ||--o{ FOOD_LOGS : owns
+    USERS ||--o{ RECOMMENDATIONS : "has (server-write-only)"
+
+    USERS {
+        string uid PK
+        string name
+        object dailyGoals
+        timestamp createdAt
+    }
+    HABITS {
+        string habitId PK
+        string uid FK
+        string title
+        array daysOfWeek
+        timestamp createdAt
+    }
+    HEALTH_LOGS {
+        string date PK "one doc per user per day"
+        string uid FK
+        number steps
+        number waterMl
+    }
+    FOOD_LOGS {
+        string foodLogId PK
+        string uid FK
+        array items
+        number totalCalories
+        string calibrationNote
+        timestamp createdAt
+    }
+    RECOMMENDATIONS {
+        string habitId PK
+        string uid FK
+        string recommendedTime
+        number confidence
+    }

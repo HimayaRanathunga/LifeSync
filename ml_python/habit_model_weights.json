@@ -1,0 +1,26 @@
+{
+  "model": "Supervised Logistic Regression (SGD + L2)",
+  "weights": [
+    2.8703366229014904,
+    -2.35329394297501,
+    4.313894284216704,
+    1.492423784716381,
+    1.0642709751713115,
+    3.1004853343654895
+  ],
+  "bias": 2.6266295834214364,
+  "features": [
+    "hour_norm",
+    "is_weekend",
+    "historical_success_rate",
+    "sleep_norm",
+    "streak_norm",
+    "habit_age_norm"
+  ],
+  "metrics": {
+    "accuracy": 1.0,
+    "log_loss": 0.00032980887835176866,
+    "epochs": 80,
+    "samples": 3000
+  }
+}

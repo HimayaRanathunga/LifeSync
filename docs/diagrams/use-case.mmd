@@ -1,0 +1,30 @@
+flowchart LR
+    User(("User"))
+
+    subgraph UseCases["LifeSync — Use Cases"]
+        UC1["Sign up / Log in"]
+        UC2["Complete onboarding\n(profile & goals)"]
+        UC3["Add / edit / complete habit"]
+        UC4["View AI-recommended\nhabit time"]
+        UC5["Log daily health data\n(steps, water)"]
+        UC6["Scan food photo for\ncalorie/condition analysis"]
+        UC7["Receive adaptive\nreminder notification"]
+        UC8["View dashboard trends\n& streaks"]
+        UC9["Edit daily goals /\nsettings"]
+    end
+
+    System["Cloud Functions\n(ML recommender,\nGemini vision)"]
+
+    User --> UC1
+    User --> UC2
+    User --> UC3
+    User --> UC4
+    User --> UC5
+    User --> UC6
+    User --> UC7
+    User --> UC8
+    User --> UC9
+
+    UC4 -.->|"triggers"| System
+    UC6 -.->|"triggers"| System
+    System -.->|"schedules"| UC7

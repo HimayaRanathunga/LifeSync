@@ -1,0 +1,61 @@
+{
+  "model": "Ridge Multiple Linear Regression (Closed-Form Analytical)",
+  "weights": [
+    591.9262555811706,
+    22.98059447728928,
+    -9.73673418193265,
+    -136.5863993361423,
+    -219.96996963686792,
+    50.2676118276849,
+    113.2631246030989,
+    85.03879583277347,
+    371.92362334959853,
+    60.6367621710648,
+    -124.7334402663687,
+    -147.128003984678,
+    108.54327686247998,
+    -174.83689708384088,
+    0.33765536722273737
+  ],
+  "bias": 4.228958129862937,
+  "features": [
+    "portion_grams_norm",
+    "cat_rice",
+    "cat_dhal",
+    "cat_polos",
+    "cat_gotukola",
+    "cat_fish",
+    "cat_chicken",
+    "cat_egg",
+    "cat_bread",
+    "cat_hoppers",
+    "cat_wattakka",
+    "cat_bandakka",
+    "cat_kadala",
+    "cat_salad",
+    "cat_curry"
+  ],
+  "categories": [
+    "rice",
+    "dhal",
+    "polos",
+    "gotukola",
+    "fish",
+    "chicken",
+    "egg",
+    "bread",
+    "hoppers",
+    "wattakka",
+    "bandakka",
+    "kadala",
+    "salad",
+    "curry"
+  ],
+  "metrics": {
+    "r2_score": 0.9014125068984356,
+    "mae_kcal": 44.68359957588078,
+    "rmse_kcal": 63.42180314698339,
+    "baseline_mae_kcal": 163.11653688411653,
+    "improvement_pct": 72.60633383381263
+  }
+}
