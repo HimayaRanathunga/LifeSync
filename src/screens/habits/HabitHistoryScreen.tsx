@@ -13,6 +13,7 @@ import DateStrip from '../../components/DateStrip';
 import PillListRow from '../../components/PillListRow';
 import { TAB_BAR_CLEARANCE } from '../../constants/layout';
 import type { HabitLog } from '../../types';
+import { toDateKey } from '../../utils/dates';
 
 function last7Days(): string[] {
   const dates: string[] = [];
@@ -20,7 +21,7 @@ function last7Days(): string[] {
   for (let i = 6; i >= 0; i--) {
     const d = new Date(today);
     d.setDate(d.getDate() - i);
-    dates.push(d.toISOString().slice(0, 10));
+    dates.push(toDateKey(d));
   }
   return dates;
 }

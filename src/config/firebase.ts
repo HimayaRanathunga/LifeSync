@@ -36,7 +36,18 @@ try {
 let db: Firestore;
 try {
   db = initializeFirestore(app, {
-    experimentalAutoDetectLongPolling: true,
+    // Force long-polling rather than auto-detecting it.
+    //
+    // Firestore's default transport is WebChannel over streaming fetch. In React Native that
+    // stream can be established and then silently stall: writes sit pending forever and snapshot
+    // listeners never fire a first result — no error is thrown, so `await setDoc(...)` simply
+    // never settles. `experimentalAutoDetectLongPolling` is meant to notice this and fall back,
+    // but the detection itself relies on the same transport and frequently does not fire.
+    //
+    // Forcing long-polling trades a little latency for a connection that actually completes.
+    // Verified against this project: the identical write succeeds from Node (default transport)
+    // while hanging indefinitely in Expo Go until this flag was set.
+    experimentalForceLongPolling: true,
   });
 } catch {
   db = getFirestore(app);

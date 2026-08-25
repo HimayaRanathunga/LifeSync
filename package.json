@@ -40,7 +40,9 @@
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",
-    "web": "expo start --web"
+    "web": "expo start --web",
+    "train": "python ml_python/train_habit_recommender.py",
+    "verify:ml": "python ml_python/verify_parity.py"
   },
   "private": true
 }

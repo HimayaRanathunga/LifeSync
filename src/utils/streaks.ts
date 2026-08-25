@@ -1,4 +1,5 @@
 import type { Habit, HabitLog } from '../types';
+import { toDateKey } from './dates';
 
 export interface Streak {
   habitId: string;
@@ -16,12 +17,12 @@ function currentStreakFromDates(dates: Set<string>): number {
   const cursor = new Date();
   cursor.setHours(0, 0, 0, 0);
 
-  if (!dates.has(cursor.toISOString().slice(0, 10))) {
+  if (!dates.has(toDateKey(cursor))) {
     cursor.setDate(cursor.getDate() - 1);
   }
 
   let days = 0;
-  while (dates.has(cursor.toISOString().slice(0, 10))) {
+  while (dates.has(toDateKey(cursor))) {
     days += 1;
     cursor.setDate(cursor.getDate() - 1);
   }

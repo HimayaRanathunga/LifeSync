@@ -7,6 +7,7 @@ import {
   StyleSheet,
   Animated,
   Easing,
+  ActivityIndicator,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
@@ -19,31 +20,46 @@ import {
   fetchRecentHealthLogs,
 } from '../../services/logsService';
 import { subscribeToUserProfile } from '../../services/profileService';
-import { useTodaySteps } from '../../hooks/useTodaySteps';
+import { useTodayStepsState } from '../../hooks/useTodaySteps';
 import { useHeartRate } from '../../hooks/useHeartRate';
-import { DEFAULT_DAILY_GOALS } from '../../constants/goals';
+import { DEFAULT_DAILY_GOALS, positiveGoalOr } from '../../constants/goals';
 import CircularProgressRing from '../../components/CircularProgressRing';
-import type { DailyGoals, HealthLog } from '../../types';
+import type { DailyGoals, HealthLog, UserProfile } from '../../types';
+import { toDateKey } from '../../utils/dates';
+import { estimateActiveBurnKcal, estimateDistanceKm } from '../../utils/activity';
 
 export default function HealthScreen() {
   const { user } = useAuth();
   const { isDark } = useTheme();
   const insets = useSafeAreaInsets();
   const navigation = useNavigation<any>();
-  const today = new Date().toISOString().slice(0, 10);
+  const today = toDateKey();
 
-  const [todayHealthLog, setTodayHealthLog] = useState<HealthLog | null>(null);
-  const [recentHealthLogs, setRecentHealthLogs] = useState<HealthLog[]>([]);
+  // `undefined` = first snapshot not in yet, `null` = loaded and there is no document for today.
+  // Collapsing the two made a still-loading value indistinguishable from a real zero.
+  const [todayHealthLog, setTodayHealthLog] = useState<HealthLog | null | undefined>(undefined);
+  const [recentHealthLogs, setRecentHealthLogs] = useState<HealthLog[] | null>(null);
   const [goals, setGoals] = useState<DailyGoals>(DEFAULT_DAILY_GOALS);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
   const [selectedDayIndex, setSelectedDayIndex] = useState(6); // Today
 
-  const steps = useTodaySteps(user?.uid) || 6840;
+  const stepsState = useTodayStepsState(user?.uid);
+  const steps = stepsState.status === 'ready' ? stepsState.steps : null;
   const heartScale = useRef(new Animated.Value(1)).current;
   const bpm = useHeartRate();
 
-  const todayWater = todayHealthLog?.waterMl ?? 1750;
-  const waterProgress = Math.min(1, todayWater / goals.waterTargetMl);
-  const stepProgress = Math.min(1, steps / goals.stepTarget);
+  // Guarded rather than read straight off the profile: Settings does not validate its goal
+  // editor, so a zero or negative target can already exist and would produce a NaN or negative
+  // width in every bar and ring below.
+  const stepTarget = positiveGoalOr(goals.stepTarget, DEFAULT_DAILY_GOALS.stepTarget);
+  const waterTarget = positiveGoalOr(goals.waterTargetMl, DEFAULT_DAILY_GOALS.waterTargetMl);
+
+  const todayWater = todayHealthLog === undefined ? null : todayHealthLog?.waterMl ?? 0;
+  const waterProgress = todayWater === null ? null : Math.min(1, Math.max(0, todayWater / waterTarget));
+  const stepProgress = steps === null ? null : Math.min(1, Math.max(0, steps / stepTarget));
+
+  const distanceKm = steps === null ? null : estimateDistanceKm(steps, profile?.heightCm);
+  const activeBurnKcal = steps === null ? null : estimateActiveBurnKcal(steps, profile?.weightKg);
 
   useEffect(() => {
     const heartbeat = Animated.loop(
@@ -85,13 +101,20 @@ export default function HealthScreen() {
   useEffect(() => {
     if (!user) return;
     const unsubProfile = subscribeToUserProfile(user.uid, (p) => {
+      // The whole profile is kept, not just the goals: heightCm/weightKg drive the distance and
+      // active-burn estimates in the activity grid.
+      setProfile(p);
       if (p?.dailyGoals) setGoals(p.dailyGoals);
     });
     const unsubHealth = subscribeToTodayHealthLog(user.uid, today, setTodayHealthLog);
 
     const sinceDate = new Date();
     sinceDate.setDate(sinceDate.getDate() - 20);
-    fetchRecentHealthLogs(user.uid, sinceDate.toISOString().slice(0, 10)).then(setRecentHealthLogs);
+    // A rejected history read previously became an unhandled rejection and left the chart stuck
+    // in its loading state forever.
+    fetchRecentHealthLogs(user.uid, toDateKey(sinceDate))
+      .then(setRecentHealthLogs)
+      .catch(() => setRecentHealthLogs([]));
 
     return () => {
       unsubProfile();
@@ -107,35 +130,68 @@ export default function HealthScreen() {
   // Last 7 days of real step data (falls back to today's live step count for days with no
   // logged history yet, e.g. a brand-new account).
   const last7Days = useMemo(() => {
-    const logsByDate = new Map(recentHealthLogs.map((l) => [l.date, l]));
+    const logsByDate = new Map((recentHealthLogs ?? []).map((l) => [l.date, l]));
     const days: { dateKey: string; label: string; steps: number }[] = [];
     for (let i = 6; i >= 0; i--) {
       const d = new Date();
       d.setDate(d.getDate() - i);
-      const dateKey = d.toISOString().slice(0, 10);
+      const dateKey = toDateKey(d);
       const isToday = dateKey === today;
       const log = logsByDate.get(dateKey);
       days.push({
         dateKey,
         label: d.toLocaleDateString(undefined, { weekday: 'short' }).slice(0, 3),
-        steps: isToday ? steps : log?.steps ?? 0,
+        // A null live reading (loading / no pedometer) falls back to whatever was persisted for
+        // today rather than punching a hole in the chart.
+        steps: isToday ? steps ?? log?.steps ?? 0 : log?.steps ?? 0,
       });
     }
     return days;
   }, [recentHealthLogs, steps, today]);
 
+  /**
+   * Daily Goal Score — a weighted goal-attainment index, renamed from "Daily Vitality Score".
+   *
+   * "Vitality" is not computable from anything this app measures: there is no HRV, no real heart
+   * rate (heartRateService is an explicit simulation), no sleep staging and no recovery signal.
+   * A number under that label would be invented. Goal attainment, by contrast, is verifiable —
+   * every component below is something the user logged against a target they set.
+   *
+   * Weights are renormalised over only the components that have data, and the card states how
+   * many of the three contributed, so a score built from steps and water alone cannot be mistaken
+   * for a complete picture. Renders "—" when nothing has been logged at all.
+   */
+  const goalScore = useMemo(() => {
+    // Steps and hydration only. A sleep component was considered and dropped: nothing in the app
+    // writes HealthLog.sleepHours — upsertHealthLog has no call sites — so it would have been a
+    // permanently-absent third of the score.
+    const WEIGHTS = { steps: 0.6, water: 0.4 };
+
+    const parts: { weight: number; ratio: number }[] = [];
+    if (steps !== null) {
+      parts.push({ weight: WEIGHTS.steps, ratio: Math.min(1, steps / stepTarget) });
+    }
+    if (todayWater !== null) {
+      parts.push({ weight: WEIGHTS.water, ratio: Math.min(1, todayWater / waterTarget) });
+    }
+
+    if (parts.length === 0) return { score: null as number | null, available: 0, band: 'Log data to see your score' };
+
+    const weightSum = parts.reduce((sum, p) => sum + p.weight, 0);
+    const score = Math.round((100 * parts.reduce((sum, p) => sum + p.weight * p.ratio, 0)) / weightSum);
+
+    const band =
+      score >= 90 ? 'All goals on track'
+      : score >= 70 ? 'Most goals on track'
+      : score >= 40 ? 'Behind on some goals'
+      : 'Just getting started';
+
+    return { score, available: parts.length, band };
+  }, [steps, stepTarget, todayWater, waterTarget]);
+
   const weeklySteps = last7Days.map((d) => d.steps);
   const dayNames = last7Days.map((d) => d.label);
   const weeklyStepsAvg = Math.round(weeklySteps.reduce((sum, s) => sum + s, 0) / weeklySteps.length) || 0;
-
-  // Sleep Recovery — average over the fetched window, falling back gracefully with no data yet.
-  const sleepStats = useMemo(() => {
-    const withSleep = recentHealthLogs.filter((l) => typeof l.sleepHours === 'number' && l.sleepHours > 0);
-    const latest = todayHealthLog?.sleepHours || withSleep[withSleep.length - 1]?.sleepHours || 0;
-    const avg = withSleep.length > 0 ? withSleep.reduce((sum, l) => sum + l.sleepHours, 0) / withSleep.length : 0;
-    const qualityPct = Math.min(100, Math.round(((latest || avg) / 8) * 100));
-    return { latest, avg, qualityPct, sampleCount: withSleep.length };
-  }, [recentHealthLogs, todayHealthLog]);
 
   const styles = useMemo(
     () =>
@@ -365,35 +421,11 @@ export default function HealthScreen() {
           color: '#2563EB',
         },
 
-        // Sleep Recovery Card
-        sleepCard: {
-          backgroundColor: isDark ? '#1E293B' : '#F5F3FF',
-          borderRadius: 22,
-          padding: 18,
-          borderWidth: 1,
-          borderColor: isDark ? '#334155' : '#DDD6FE',
-          marginBottom: 18,
-        },
         sleepHeaderRow: {
           flexDirection: 'row',
           alignItems: 'center',
           justifyContent: 'space-between',
           marginBottom: 10,
-        },
-        sleepTitle: {
-          fontSize: 15,
-          fontWeight: '800',
-          color: '#4F46E5',
-        },
-        sleepDuration: {
-          fontSize: 24,
-          fontWeight: '900',
-          color: isDark ? '#F8FAFC' : '#0F172A',
-        },
-        sleepSub: {
-          fontSize: 12,
-          color: isDark ? '#94A3B8' : '#64748B',
-          marginTop: 2,
         },
       }),
     [isDark, insets]
@@ -413,30 +445,41 @@ export default function HealthScreen() {
           </Pressable>
         </View>
 
-        {/* Hero Vitality Score Card */}
+        {/* Goal attainment, not a physiological score — see the goalScore memo above. */}
         <View style={styles.heroVitalityCard}>
           <View style={styles.heroLeft}>
-            <Text style={styles.heroSub}>Daily Vitality Score</Text>
-            <Text style={styles.heroTitle}>94<Text style={{ fontSize: 16, color: '#64748B' }}> /100</Text></Text>
+            <Text style={styles.heroSub}>Daily Goal Score</Text>
+            <Text style={styles.heroTitle}>
+              {goalScore.score ?? '—'}
+              <Text style={{ fontSize: 16, color: '#64748B' }}> /100</Text>
+            </Text>
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-              <Ionicons name="checkmark-circle" size={13} color="#10B981" />
-              <Text style={styles.heroTag}>Optimal Energy & Recovery</Text>
+              {goalScore.score !== null ? (
+                <Ionicons name="checkmark-circle" size={13} color="#10B981" />
+              ) : null}
+              <Text style={styles.heroTag}>{goalScore.band}</Text>
             </View>
+            <Text style={{ fontSize: 10, color: isDark ? '#94A3B8' : '#64748B', marginTop: 2 }}>
+              Based on {goalScore.available} of 2 daily goals
+            </Text>
           </View>
           <CircularProgressRing
             size={86}
             strokeWidth={8}
-            progress={0.94}
+            progress={(goalScore.score ?? 0) / 100}
             leftLabel="Score"
-            leftValue="94%"
+            leftValue={goalScore.score === null ? '—' : String(goalScore.score)}
             ringColor="#10B981"
             trackColor={isDark ? '#334155' : '#E2E8F0'}
             textColor={isDark ? '#F8FAFC' : '#0F172A'}
           />
         </View>
 
-        {/* 4-Card Fitness Grid */}
-        <Text style={styles.sectionTitle}>Activity & Workout Burn</Text>
+        {/* Section renamed from "Activity & Workout Burn": there is no workout tracking in this
+            app. The 80% / 4.8km / 75% corner badges are gone — none had a denominator behind it,
+            and "Workout Duration 45 min" had no source at all (Expo's Pedometer reports a
+            cumulative step delta with no timestamps, so active minutes cannot be derived). */}
+        <Text style={styles.sectionTitle}>Activity Today</Text>
         <View style={styles.fitnessGrid}>
           {/* Steps */}
           <View style={styles.fitnessCard}>
@@ -444,48 +487,74 @@ export default function HealthScreen() {
               <View style={[styles.fitnessIconBox, { backgroundColor: '#EDE9FE' }]}>
                 <Ionicons name="footsteps" size={16} color="#7C3AED" />
               </View>
-              <Text style={{ fontSize: 10, fontWeight: '700', color: '#7C3AED' }}>68%</Text>
+              <Text style={{ fontSize: 10, fontWeight: '700', color: '#7C3AED' }}>
+                {stepProgress === null ? '—' : `${Math.round(stepProgress * 100)}%`}
+              </Text>
             </View>
-            <Text style={styles.fitnessCardValue}>{steps.toLocaleString()}</Text>
-            <Text style={styles.fitnessCardLabel}>Steps / 10,000</Text>
+            <Text style={styles.fitnessCardValue}>
+              {steps === null ? '—' : steps.toLocaleString()}
+            </Text>
+            <Text style={styles.fitnessCardLabel}>
+              {stepsState.status === 'unavailable'
+                ? stepsState.reason === 'permission-denied'
+                  ? 'Step permission not granted'
+                  : 'Pedometer unavailable'
+                : `Steps / ${stepTarget.toLocaleString()}`}
+            </Text>
           </View>
 
-          {/* Active Calories Burned */}
+          {/* Estimated active burn — needs body weight, so null rather than a guess. */}
           <View style={styles.fitnessCard}>
             <View style={styles.fitnessCardHeader}>
               <View style={[styles.fitnessIconBox, { backgroundColor: '#FFEDD5' }]}>
                 <Ionicons name="flame" size={16} color="#EA580C" />
               </View>
-              <Text style={{ fontSize: 10, fontWeight: '700', color: '#EA580C' }}>80%</Text>
             </View>
-            <Text style={styles.fitnessCardValue}>480 kcal</Text>
-            <Text style={styles.fitnessCardLabel}>Active Calorie Burn</Text>
+            <Text style={styles.fitnessCardValue}>
+              {activeBurnKcal === null ? '—' : `${activeBurnKcal} kcal`}
+            </Text>
+            <Text style={styles.fitnessCardLabel}>
+              {activeBurnKcal === null ? 'Add your weight' : 'Est. active burn'}
+            </Text>
           </View>
 
-          {/* Distance */}
+          {/* Estimated distance — needs height for stride length. */}
           <View style={styles.fitnessCard}>
             <View style={styles.fitnessCardHeader}>
               <View style={[styles.fitnessIconBox, { backgroundColor: '#E0F2FE' }]}>
                 <Ionicons name="navigate" size={16} color="#0284C7" />
               </View>
-              <Text style={{ fontSize: 10, fontWeight: '700', color: '#0284C7' }}>4.8km</Text>
             </View>
-            <Text style={styles.fitnessCardValue}>4.8 km</Text>
-            <Text style={styles.fitnessCardLabel}>Walking Distance</Text>
+            <Text style={styles.fitnessCardValue}>
+              {distanceKm === null ? '—' : `${distanceKm.toFixed(2)} km`}
+            </Text>
+            <Text style={styles.fitnessCardLabel}>
+              {distanceKm === null ? 'Add your height' : 'Est. distance'}
+            </Text>
           </View>
 
-          {/* Active Time */}
+          {/* Replaces "Workout Duration" with a figure the app can actually compute. */}
           <View style={styles.fitnessCard}>
             <View style={styles.fitnessCardHeader}>
               <View style={[styles.fitnessIconBox, { backgroundColor: '#DCFCE7' }]}>
-                <Ionicons name="time" size={16} color="#059669" />
+                <Ionicons name="trending-up" size={16} color="#059669" />
               </View>
-              <Text style={{ fontSize: 10, fontWeight: '700', color: '#059669' }}>75%</Text>
             </View>
-            <Text style={styles.fitnessCardValue}>45 min</Text>
-            <Text style={styles.fitnessCardLabel}>Workout Duration</Text>
+            <Text style={styles.fitnessCardValue}>{weeklyStepsAvg.toLocaleString()}</Text>
+            <Text style={styles.fitnessCardLabel}>7-day avg steps</Text>
           </View>
         </View>
+
+        {(distanceKm === null || activeBurnKcal === null) && steps !== null ? (
+          <Pressable
+            onPress={() => navigation.navigate('Food', { screen: 'FoodHealthDetail' })}
+            accessibilityRole="button"
+          >
+            <Text style={{ fontSize: 11, color: '#3B82F6', fontWeight: '700', textAlign: 'center', marginTop: 8 }}>
+              Add your height & weight to see distance and burn estimates
+            </Text>
+          </Pressable>
+        ) : null}
 
         {/* 7-Day Step Count Trend Chart */}
         <View style={styles.chartCard}>
@@ -493,9 +562,24 @@ export default function HealthScreen() {
             <Text style={styles.chartTitle}>7-Day Step Performance</Text>
             <Text style={styles.chartAvg}>Avg: {weeklyStepsAvg.toLocaleString()}/day</Text>
           </View>
+          {/* Seven flat zero-height bars are indistinguishable from a broken chart, so a brand-new
+              account gets an explicit message instead. */}
+          {recentHealthLogs === null ? (
+            <View style={{ paddingVertical: 24, alignItems: 'center' }}>
+              <ActivityIndicator color="#10B981" />
+            </View>
+          ) : weeklySteps.every((v) => v === 0) ? (
+            <View style={{ paddingVertical: 24, alignItems: 'center' }}>
+              <Text style={{ fontSize: 12, color: isDark ? '#94A3B8' : '#64748B' }}>
+                No step history yet — your first day starts today.
+              </Text>
+            </View>
+          ) : (
           <View style={styles.barsRow}>
             {weeklySteps.map((count, index) => {
-              const heightPct = Math.min(100, (count / 10000) * 100);
+              // Was hardcoded to 10,000, contradicting the user's own step target (default 8,000
+              // and editable in Settings).
+              const heightPct = Math.min(100, Math.max(0, (count / stepTarget) * 100));
               const isToday = index === 6;
               return (
                 <View key={index} style={styles.barCol}>
@@ -515,10 +599,12 @@ export default function HealthScreen() {
               );
             })}
           </View>
+          )}
         </View>
 
         {/* Hydration & Heart Rate Grid */}
-        <Text style={styles.sectionTitle}>Real-Time Vitals</Text>
+        {/* "Real-Time" overstated it: hydration is user-logged and the BPM below is simulated. */}
+        <Text style={styles.sectionTitle}>Today's Vitals</Text>
         <View style={styles.vitalGrid}>
           {/* Hydration */}
           <View style={styles.vitalCard}>
@@ -526,7 +612,10 @@ export default function HealthScreen() {
               <Text style={styles.vitalTitle}>Hydration</Text>
               <Ionicons name="water" size={18} color="#0284C7" />
             </View>
-            <Text style={styles.vitalValue}>{todayWater} <Text style={{ fontSize: 13 }}>ml</Text></Text>
+            <Text style={styles.vitalValue}>
+              {todayWater === null ? '—' : todayWater.toLocaleString()}{' '}
+              <Text style={{ fontSize: 13 }}>ml</Text>
+            </Text>
             <View style={styles.quickWaterRow}>
               <Pressable style={styles.quickWaterBtn} onPress={() => handleQuickAddWater(250)}>
                 <Text style={styles.quickWaterText}>+250ml</Text>
@@ -537,42 +626,41 @@ export default function HealthScreen() {
             </View>
           </View>
 
-          {/* Heart Rate */}
+          {/*
+            Heart rate is simulated. Expo exposes no HR sensor without HealthKit / Health Connect
+            or a BLE wearable, none of which are available in a managed Expo Go build, so
+            heartRateService drives a bounded random walk. The SIMULATED chip makes that visible
+            instead of leaving the number to be read as a measurement, and the verdict below is
+            derived from the displayed value rather than asserted unconditionally.
+          */}
           <View style={styles.vitalCard}>
             <View style={styles.vitalTop}>
-              <Text style={styles.vitalTitle}>Heart Rate</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5 }}>
+                <Text style={styles.vitalTitle}>Heart Rate</Text>
+                <View style={{ backgroundColor: isDark ? '#334155' : '#E2E8F0', paddingHorizontal: 5, paddingVertical: 1, borderRadius: 4 }}>
+                  <Text style={{ fontSize: 8, fontWeight: '800', color: isDark ? '#94A3B8' : '#64748B' }}>
+                    SIMULATED
+                  </Text>
+                </View>
+              </View>
               <Animated.View style={{ transform: [{ scale: heartScale }] }}>
                 <Ionicons name="heart" size={18} color="#EF4444" />
               </Animated.View>
             </View>
             <Text style={styles.vitalValue}>{bpm} <Text style={{ fontSize: 13 }}>BPM</Text></Text>
             <View style={[styles.quickWaterRow, { marginTop: 10, alignItems: 'center', gap: 4 }]}>
-              <Ionicons name="checkmark-circle" size={13} color="#10B981" />
-              <Text style={{ fontSize: 11, color: '#10B981', fontWeight: '800' }}>Steady & Rested</Text>
+              <Ionicons
+                name={bpm >= 60 && bpm <= 100 ? 'checkmark-circle' : 'alert-circle'}
+                size={13}
+                color={bpm >= 60 && bpm <= 100 ? '#10B981' : '#EA580C'}
+              />
+              <Text style={{ fontSize: 11, color: bpm >= 60 && bpm <= 100 ? '#10B981' : '#EA580C', fontWeight: '800' }}>
+                {bpm >= 60 && bpm <= 100 ? 'Within resting range' : 'Outside resting range'}
+              </Text>
             </View>
           </View>
         </View>
 
-        {/* Sleep Recovery Card */}
-        <View style={styles.sleepCard}>
-          <View style={styles.sleepHeaderRow}>
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-              <Ionicons name="moon" size={15} color="#4F46E5" />
-              <Text style={styles.sleepTitle}>Sleep Recovery & Circadian</Text>
-            </View>
-            <Ionicons name="sparkles" size={16} color="#7C3AED" />
-          </View>
-          <Text style={styles.sleepDuration}>
-            {sleepStats.sampleCount > 0
-              ? `${Math.floor(sleepStats.latest)}h ${Math.round((sleepStats.latest % 1) * 60)}m`
-              : '— h — m'}
-          </Text>
-          <Text style={styles.sleepSub}>
-            {sleepStats.sampleCount > 0
-              ? `${sleepStats.qualityPct}% Sleep Quality · ${sleepStats.avg.toFixed(1)}h avg over last ${sleepStats.sampleCount} days`
-              : 'No sleep data logged yet'}
-          </Text>
-        </View>
 
       </ScrollView>
     </View>

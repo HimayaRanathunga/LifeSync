@@ -7,6 +7,7 @@ import {
   TextInput,
   StyleSheet,
   Modal,
+  Alert,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -32,13 +33,15 @@ const TIME_PRESETS = [
   { label: '09:30 PM', time: '21:30', icon: 'moon' as const },
 ];
 
+// `category` must match a CATEGORIES label above — selecting a preset sets it, so the saved
+// habit's icon agrees with its title instead of contradicting it.
 const PRESETS = [
-  { title: 'Morning Cardio & Gym', time: '07:00', icon: 'barbell', color: '#EA580C', bg: '#FFEDD5' },
-  { title: 'Drink 500ml Water', time: '08:00', icon: 'water', color: '#0284C7', bg: '#E0F2FE' },
-  { title: 'Sri Lankan Veggie Lunch', time: '12:30', icon: 'restaurant', color: '#059669', bg: '#D1FAE5' },
-  { title: 'Sunset 5,000 Steps Walk', time: '18:00', icon: 'footsteps', color: '#0D9488', bg: '#CCFBF1' },
-  { title: 'Read Book & Study', time: '20:30', icon: 'book', color: '#7C3AED', bg: '#EDE9FE' },
-  { title: 'Digital Detox & Sleep', time: '22:30', icon: 'moon', color: '#4F46E5', bg: '#E0E7FF' },
+  { title: 'Morning Cardio & Gym', time: '07:00', category: 'Fitness', icon: 'barbell', color: '#EA580C', bg: '#FFEDD5' },
+  { title: 'Drink 500ml Water', time: '08:00', category: 'Hydration', icon: 'water', color: '#0284C7', bg: '#E0F2FE' },
+  { title: 'Sri Lankan Veggie Lunch', time: '12:30', category: 'Nutrition', icon: 'restaurant', color: '#059669', bg: '#D1FAE5' },
+  { title: 'Sunset 5,000 Steps Walk', time: '18:00', category: 'Fitness', icon: 'footsteps', color: '#0D9488', bg: '#CCFBF1' },
+  { title: 'Read Book & Study', time: '20:30', category: 'Growth', icon: 'book', color: '#7C3AED', bg: '#EDE9FE' },
+  { title: 'Digital Detox & Sleep', time: '22:30', category: 'Recovery', icon: 'moon', color: '#4F46E5', bg: '#E0E7FF' },
 ];
 
 function format12h(timeStr: string): string {
@@ -117,26 +120,40 @@ export default function AddEditHabitScreen({ navigation }: any) {
   const handleSave = async () => {
     if (!user || !title.trim() || saving || created || selectedDays.length === 0) return;
     setSaving(true);
-    setCreated(true);
     const habitName = title.trim();
 
-    addHabit(user.uid, {
-      title: habitName,
-      recurring: selectedDays.length === 7,
-      daysOfWeek: selectedDays,
-      preferredTime,
-    }).catch((error: any) => {
-      console.warn('Error creating habit:', error);
-    });
-
-    setTimeout(() => {
-      navigation.navigate('HabitsList', { createdHabitTitle: habitName });
-    }, 400);
+    // Awaited, and `created` is only set once the write actually succeeds. Previously the green
+    // "Habit Created!" state was set *before* the write, with the failure swallowed by a
+    // console.warn — so an offline or rejected save still showed success and navigated away,
+    // leaving the user with a habit that does not exist.
+    try {
+      await addHabit(user.uid, {
+        title: habitName,
+        category: selectedCategory,
+        recurring: selectedDays.length === 7,
+        daysOfWeek: selectedDays,
+        preferredTime,
+      });
+      setCreated(true);
+      navigation.navigate('HabitsList');
+    } catch (error: any) {
+      Alert.alert(
+        'Could not create habit',
+        error?.code === 'permission-denied'
+          ? 'The database rejected the write. Check that your Firestore rules are deployed.'
+          : error?.message ?? 'Please check your connection and try again.'
+      );
+    } finally {
+      setSaving(false);
+    }
   };
 
   const selectPreset = (p: (typeof PRESETS)[0]) => {
     setTitle(p.title);
     setPreferredTime(p.time);
+    // Without this, picking "Drink 500ml Water" left the category on whatever was selected
+    // before, so the saved habit carried a category that contradicted its own title.
+    setSelectedCategory(p.category);
   };
 
   const styles = useMemo(

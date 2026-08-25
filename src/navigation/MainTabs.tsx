@@ -120,9 +120,33 @@ export default function MainTabs() {
       })}
     >
       <Tab.Screen name="Dashboard" component={DashboardScreen} />
-      <Tab.Screen name="Activity" component={HabitsStackNavigator} />
+      {/*
+        Tabs that host a stack remember whichever screen they were left on, so after visiting a
+        detail screen the tab button stops doing what its icon says — the camera icon would
+        reopen the BMI page instead of the scanner. Resetting to the stack's first screen on
+        every tab press makes the icon mean the same thing every time.
+      */}
+      <Tab.Screen
+        name="Activity"
+        component={HabitsStackNavigator}
+        listeners={({ navigation }) => ({
+          tabPress: (e) => {
+            e.preventDefault();
+            navigation.navigate('Activity', { screen: 'HabitsList' });
+          },
+        })}
+      />
       <Tab.Screen name="Health" component={HealthScreen} />
-      <Tab.Screen name="Food" component={FoodStackNavigator} />
+      <Tab.Screen
+        name="Food"
+        component={FoodStackNavigator}
+        listeners={({ navigation }) => ({
+          tabPress: (e) => {
+            e.preventDefault();
+            navigation.navigate('Food', { screen: 'FoodScan' });
+          },
+        })}
+      />
       <Tab.Screen name="Settings" component={SettingsScreen} />
     </Tab.Navigator>
   );

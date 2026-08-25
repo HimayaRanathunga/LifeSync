@@ -8,6 +8,7 @@ import {
   Modal,
   TextInput,
   Alert,
+  ActivityIndicator,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -15,8 +16,10 @@ import { useAuth } from '../../context/AuthContext';
 import { useTheme } from '../../context/ThemeContext';
 import { subscribeToHabits, updateHabit } from '../../services/habitsService';
 import { logHabitCompletion, subscribeToHabitLogs } from '../../services/logsService';
-import { subscribeToRecommendations } from '../../services/recommendationsService';
-import type { Habit, HabitLog, Recommendation } from '../../types';
+import { subscribeToUserProfile } from '../../services/profileService';
+import { recommendForHabits, MIN_ATTEMPTS_FOR_CONFIDENCE, type LocalRecommendation } from '../../ml/recommender';
+import type { Habit, HabitLog, UserProfile } from '../../types';
+import { toDateKey } from '../../utils/dates';
 
 interface ActivityItem {
   id: string;
@@ -25,6 +28,9 @@ interface ActivityItem {
   timeMinutes: number; // e.g. 390
   title: string;
   subtitle: string;
+  preferredTime: string; // "HH:mm" — the user's own choice, not the recommendation
+  suggestedTime: string | null; // the engine's suggestion, offered rather than auto-applied
+  recReason: string | null; // the engine's own explanation, the one genuinely honest field
   icon: keyof typeof Ionicons.glyphMap;
   bgColor: string;
   iconBg: string;
@@ -41,16 +47,45 @@ const PALETTE: Array<Pick<ActivityItem, 'icon' | 'bgColor' | 'iconBg' | 'iconCol
   { icon: 'fitness-outline', bgColor: '#F5F3FF', iconBg: '#DDD6FE', iconColor: '#6D28D9', checkColor: '#7C3AED' },
 ];
 
-function paletteForHabit(habitId: string) {
+// Keyed by the category the user picked in AddEditHabitScreen. Labels must stay in sync with
+// CATEGORIES there.
+const CATEGORY_PALETTE: Record<string, (typeof PALETTE)[number]> = {
+  Fitness: { icon: 'barbell-outline', bgColor: '#FFF7ED', iconBg: '#FED7AA', iconColor: '#C2410C', checkColor: '#EA580C' },
+  Hydration: { icon: 'water-outline', bgColor: '#EFF6FF', iconBg: '#BFDBFE', iconColor: '#1D4ED8', checkColor: '#0284C7' },
+  Nutrition: { icon: 'restaurant-outline', bgColor: '#ECFDF5', iconBg: '#A7F3D0', iconColor: '#047857', checkColor: '#059669' },
+  Growth: { icon: 'book-outline', bgColor: '#F5F3FF', iconBg: '#DDD6FE', iconColor: '#6D28D9', checkColor: '#7C3AED' },
+  Mindfulness: { icon: 'flower-outline', bgColor: '#FDF4FF', iconBg: '#F5D0FE', iconColor: '#A21CAF', checkColor: '#D946EF' },
+  Recovery: { icon: 'moon-outline', bgColor: '#EEF2FF', iconBg: '#C7D2FE', iconColor: '#4338CA', checkColor: '#4F46E5' },
+};
+
+/**
+ * Habits created before `category` was persisted have none, so they fall back to a deterministic
+ * hash of the document id — arbitrary, but stable per habit. New habits use the category the
+ * user actually chose, which is why the icon now matches the title.
+ */
+function paletteForHabit(habit: Habit) {
+  if (habit.category && CATEGORY_PALETTE[habit.category]) {
+    return CATEGORY_PALETTE[habit.category];
+  }
   let hash = 0;
-  for (let i = 0; i < habitId.length; i++) hash = (hash * 31 + habitId.charCodeAt(i)) % PALETTE.length;
+  for (let i = 0; i < habit.id.length; i++) hash = (hash * 31 + habit.id.charCodeAt(i)) % PALETTE.length;
   return PALETTE[Math.abs(hash) % PALETTE.length];
 }
 
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-/** Builds the day's activity list straight from the user's real habits (+ ML-suggested times), instead of a fixed static list. */
-function buildActivitiesForDate(habits: Habit[], recommendations: Recommendation[], dateKey: string): ActivityItem[] {
+/** Below this many logged attempts the model's output is dominated by the prior rather than by
+ *  this user's data, so no percentage is shown at all. Shared with the Dashboard. */
+const MIN_ATTEMPTS_FOR_RATE = MIN_ATTEMPTS_FOR_CONFIDENCE;
+
+/** Builds the day's activity list from the user's real habits, with the on-device model's
+ *  suggestion carried alongside (but never overwriting) the time the user chose. */
+function buildActivitiesForDate(
+  habits: Habit[],
+  recommendations: LocalRecommendation[],
+  dateKey: string,
+  attemptsByHabit: Map<string, number>
+): ActivityItem[] {
   const dayOfWeek = new Date(`${dateKey}T00:00:00`).getDay();
   const recByHabit = new Map(recommendations.map((r) => [r.habitId, r]));
 
@@ -58,15 +93,30 @@ function buildActivitiesForDate(habits: Habit[], recommendations: Recommendation
     .filter((h) => h.daysOfWeek.length === 0 || h.daysOfWeek.includes(dayOfWeek))
     .map((h) => {
       const rec = recByHabit.get(h.id);
-      const timeStr = rec?.suggestedTime || h.preferredTime;
+
+      // The card shows the time the USER chose. Letting the recommendation win here meant editing
+      // a habit's time appeared to do nothing — the edit saved, then the rec overwrote the
+      // display. The suggestion is offered explicitly in the edit sheet instead.
+      const timeStr = h.preferredTime || '07:00';
       const [hh, mm] = timeStr.split(':').map(Number);
-      const timeMinutes = (hh || 0) * 60 + (mm || 0);
+      const timeMinutes = (Number.isFinite(hh) ? hh : 0) * 60 + (Number.isFinite(mm) ? mm : 0);
       const { timeSlot, period } = parseMinutesToTime(timeMinutes);
-      const subtitle = rec
-        ? `AI suggested · ${Math.round(rec.score * 100)}% likely`
-        : h.daysOfWeek.length > 0
-        ? h.daysOfWeek.map((d) => DAY_NAMES[d]).join(', ')
-        : 'Every day';
+
+      // Only claim a rate once real attempts back it. The previous server engine returned 0.5 as
+      // a literal "not enough history yet" sentinel, which the UI rendered as "50% likely" —
+      // presenting an absence of data as a confident prediction.
+      const attempts = attemptsByHabit.get(h.id) ?? 0;
+      const recScore = rec?.confidence ?? null;
+      const schedule =
+        h.daysOfWeek.length === 7
+          ? 'Every day'
+          : h.daysOfWeek.length > 0
+          ? h.daysOfWeek.map((d) => DAY_NAMES[d]).join(', ')
+          : 'Unscheduled';
+      const subtitle =
+        recScore !== null && attempts >= MIN_ATTEMPTS_FOR_RATE
+          ? `${schedule} · ${Math.round(recScore * 100)}% success rate`
+          : schedule;
 
       return {
         id: h.id,
@@ -75,7 +125,12 @@ function buildActivitiesForDate(habits: Habit[], recommendations: Recommendation
         timeMinutes,
         title: h.title,
         subtitle,
-        ...paletteForHabit(h.id),
+        preferredTime: timeStr,
+        // Carried so the edit sheet can offer the suggestion explicitly, with the engine's own
+        // wording, rather than silently applying it to the card.
+        suggestedTime: rec?.suggestedTime ?? null,
+        recReason: rec?.reason ?? null,
+        ...paletteForHabit(h),
       };
     });
 
@@ -93,7 +148,7 @@ function generateWeeklyDates(): { dayLabel: string; dateNum: string; dateKey: st
     d.setDate(today.getDate() + i);
     const dayLabel = labels[d.getDay()];
     const dateNum = d.getDate() < 10 ? `0${d.getDate()}` : `${d.getDate()}`;
-    const dateKey = d.toISOString().slice(0, 10);
+    const dateKey = toDateKey(d);
     dates.push({ dayLabel, dateNum, dateKey });
   }
   return dates;
@@ -123,8 +178,11 @@ export default function HabitsListScreen({ navigation, route }: any) {
   const weeklyDates = useMemo(() => generateWeeklyDates(), []);
   const [selectedDateKey, setSelectedDateKey] = useState(weeklyDates[3].dateKey); // default today
 
-  const [userHabits, setUserHabits] = useState<Habit[]>([]);
-  const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
+  // `null` until the first snapshot lands. Initialising to [] made "still loading" and "you have
+  // no habits" the same value, so a new user was told they had nothing scheduled before Firestore
+  // had answered.
+  const [userHabits, setUserHabits] = useState<Habit[] | null>(null);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
 
   useEffect(() => {
     if (!user) return;
@@ -133,31 +191,55 @@ export default function HabitsListScreen({ navigation, route }: any) {
 
   useEffect(() => {
     if (!user) return;
-    return subscribeToRecommendations(user.uid, setRecommendations);
+    return subscribeToUserProfile(user.uid, setProfile);
   }, [user]);
-
-  // Live-derived from the user's real habits (+ ML-suggested times) for the selected date —
-  // updates automatically whenever a habit is added/edited, no local copy to keep in sync.
-  const activities = useMemo(
-    () => buildActivitiesForDate(userHabits, recommendations, selectedDateKey),
-    [userHabits, recommendations, selectedDateKey]
-  );
 
   // Real completion history from Firestore — so past-day completion state (not just today's
   // session) reflects what was actually logged, e.g. via seeded data or earlier app sessions.
-  const [habitLogs, setHabitLogs] = useState<HabitLog[]>([]);
+  const [habitLogs, setHabitLogs] = useState<HabitLog[] | null>(null);
   useEffect(() => {
     if (!user) return;
     return subscribeToHabitLogs(user.uid, setHabitLogs);
   }, [user]);
 
-  // Keyed by `${date}_${habitId}`. A habit can have more than one log for the same day (each
-  // toggle adds a new log doc rather than upserting) — last one in snapshot order wins, which
-  // in practice tracks insertion order for auto-ID docs.
+  // How many days this habit has actually been attempted — gates whether a success rate is
+  // shown at all, so a placeholder score is never dressed up as a statistic.
+  const attemptsByHabit = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const l of habitLogs ?? []) m.set(l.habitId, (m.get(l.habitId) ?? 0) + 1);
+    return m;
+  }, [habitLogs]);
+
+  // Live-derived from the user's real habits for the selected date — updates automatically
+  // whenever a habit is added/edited, no local copy to keep in sync.
+  // Same on-device model the Dashboard uses, so the two screens can never disagree about what
+  // was suggested. The Firestore `recommendations` collection it read before is only ever
+  // populated by a Cloud Function that this project does not deploy.
+  const recommendations = useMemo(
+    () => (habitLogs === null ? [] : recommendForHabits(userHabits ?? [], habitLogs, profile)),
+    [userHabits, habitLogs, profile]
+  );
+
+  const activities = useMemo(
+    () => buildActivitiesForDate(userHabits ?? [], recommendations, selectedDateKey, attemptsByHabit),
+    [userHabits, recommendations, selectedDateKey, attemptsByHabit]
+  );
+
+  const isLoading = !user || userHabits === null || habitLogs === null;
+
+  // Keyed by `${date}_${habitId}`. Writes are now upserts on a deterministic document id
+  // (see logsService.logHabitCompletion), but accounts created before that change can still
+  // hold several auto-ID documents for the same habit-day. The canonical document wins; legacy
+  // duplicates only fill in where no canonical one exists, so the tick is deterministic either
+  // way rather than depending on snapshot ordering.
   const completedMap = useMemo(() => {
     const map: Record<string, boolean> = {};
-    for (const log of habitLogs) {
-      map[`${log.date}_${log.habitId}`] = log.success;
+    for (const log of habitLogs ?? []) {
+      const key = `${log.date}_${log.habitId}`;
+      const isCanonical = log.id === `${log.habitId}_${log.date}`;
+      if (isCanonical || !(key in map)) {
+        map[key] = log.success;
+      }
     }
     return map;
   }, [habitLogs]);
@@ -509,10 +591,18 @@ export default function HabitsListScreen({ navigation, route }: any) {
 
         {/* Timeline Activities List — generated from the user's real habits for this date */}
         <View style={styles.timelineContainer}>
-          {activities.length === 0 ? (
+          {isLoading ? (
+            <View style={styles.emptyState}>
+              <ActivityIndicator color="#2563EB" />
+            </View>
+          ) : activities.length === 0 ? (
             <View style={styles.emptyState}>
               <Ionicons name="calendar-outline" size={28} color="#94A3B8" />
-              <Text style={styles.emptyStateText}>No habits scheduled for this day.</Text>
+              <Text style={styles.emptyStateText}>
+                {userHabits!.length === 0
+                  ? "You haven't added any habits yet."
+                  : `Nothing scheduled for ${new Date(`${selectedDateKey}T00:00:00`).toLocaleDateString(undefined, { weekday: 'long' })}.`}
+              </Text>
               <Pressable onPress={() => navigation.navigate('AddEditHabit')}>
                 <Text style={styles.emptyStateLink}>+ Add a habit</Text>
               </Pressable>
@@ -609,6 +699,32 @@ export default function HabitsListScreen({ navigation, route }: any) {
                 <Ionicons name="add" size={20} color={isDark ? '#FFFFFF' : '#0F172A'} />
               </Pressable>
             </View>
+
+            {/*
+              The recommendation is offered here rather than silently overwriting the card's time.
+              `reason` is the engine's own wording — the one field it produces that is honest
+              regardless of how much history exists — and it was previously rendered nowhere.
+            */}
+            {editingItem?.suggestedTime && editingItem.suggestedTime !== editingItem.preferredTime ? (
+              <View style={{ gap: 6 }}>
+                {editingItem.recReason ? (
+                  <Text style={{ fontSize: 12, color: '#64748B', lineHeight: 16 }}>
+                    {editingItem.recReason}
+                  </Text>
+                ) : null}
+                <Pressable
+                  onPress={() => {
+                    const [h, m] = editingItem.suggestedTime!.split(':').map(Number);
+                    setEditingMinutes((Number.isFinite(h) ? h : 0) * 60 + (Number.isFinite(m) ? m : 0));
+                  }}
+                  accessibilityRole="button"
+                >
+                  <Text style={styles.emptyStateLink}>
+                    Use suggested time ({editingItem.suggestedTime})
+                  </Text>
+                </Pressable>
+              </View>
+            ) : null}
 
             <Pressable style={styles.saveTimeBtn} onPress={saveActivityEdits} disabled={savingEdit}>
               <Text style={styles.saveTimeBtnText}>{savingEdit ? 'Saving…' : 'Done'}</Text>

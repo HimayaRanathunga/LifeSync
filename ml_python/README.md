@@ -1,19 +1,120 @@
-# 🤖 LifeSync AI - Python Machine Learning Engine
+# LifeSync — Habit-Timing ML
 
-This module contains the standalone **Python Machine Learning & Deep Learning subsystem** for LifeSync (CMP 7003 PRAC1 Project).
+Python trains the model; the phone runs it. This module is **wired into the app**, not a parallel
+experiment — the weights it writes are the ones the running app scores with.
 
-## 📂 Module Structure
-- `train_habit_recommender.py`: Supervised Logistic Regression model with SGD & L2 regularization for circadian habit slot optimization.
-- `train_calorie_model.py`: Multiple Linear / Ridge Regression model for portion-to-calorie calibration.
-- `food_classifier.py`: Real-world botanical food vision model for Sri Lankan dishes and Non-Food detection.
-- `ml_api_server.py`: Flask REST microservice API exposing `/api/predict_habit_slot` and `/api/predict_food_calories`.
-- `requirements.txt`: Package dependencies.
-
-## 🚀 Execution Instructions
-```bash
-cd ml_python
-pip install -r requirements.txt
-python train_habit_recommender.py
-python train_calorie_model.py
-python ml_api_server.py
 ```
+ml_python/                        Python — training only
+  features.py                     feature engineering  ─┐
+  historical_rate.py              kernel success rate  ─┤ must mirror src/ml/ exactly
+  synthetic_data.py               training population   │
+  train_habit_recommender.py      scikit-learn fit + evaluation + export
+  verify_parity.py                proves the mirror holds ─┘
+
+src/ml/                           TypeScript — inference only, bundled into the app
+  features.ts                     mirror of features.py
+  historicalRate.ts               mirror of historical_rate.py
+  logisticRegression.ts           dot product + sigmoid (no training code, deliberately)
+  recommender.ts                  scores all candidate hours, returns the best
+  model/weights.generated.ts      ← written by train_habit_recommender.py
+```
+
+## Why split it this way
+
+Python cannot run on a phone, so it is used for training only. The exported model is a few dozen
+floats, and inference is a dot product plus a sigmoid — cheap enough to evaluate on-device with no
+native ML runtime and no model download.
+
+That is not just convenient, it is what makes the feature exist at all: the server-side equivalent
+needs a Firebase Blaze plan and a deploy step, so on an undeployed project the `recommendations`
+collection is permanently empty. Running the model locally means suggestions appear as soon as the
+user has habits, keep working with no network, and update the instant a completion is logged.
+
+## Running it
+
+```bash
+pip install -r requirements.txt
+npm run train        # fits the model, prints the evaluation, rewrites weights.generated.ts
+npm run verify:ml    # checks the Python and TypeScript feature pipelines still agree
+```
+
+**Run `npm run verify:ml` after touching either feature implementation.** The model is fitted on
+vectors from `features.py` and queried in the app with vectors from `features.ts`. If those drift
+apart nothing raises an error — the model just quietly gets worse. The check compares 300 random
+cases and currently agrees to within 1.1e-16 (floating-point noise).
+
+## What the model does
+
+For each habit it scores all 17 candidate hours (06:00–22:00) and returns the highest. Features:
+
+| Feature | Why |
+|---|---|
+| `hourOffsetSin` / `hourOffsetCos` | Hour **relative to the user's chosen time**, not absolute. An absolute encoding can only learn one population-wide "good time", which is wrong for anyone whose routine differs — and measured worse than just using the user's own time. |
+| `historicalSuccessRate` | Recency- and proximity-weighted rate for that hour, **shrunk toward 0.5** (see below). |
+| `evidenceNorm` | How much history backs that rate, so the model can learn how far to trust it. |
+| `isAwake`, `isDuringWork` | From the user's own `wakeTime` / `workStart` / `workEnd`. These were collected at onboarding and read by nothing before this model. |
+| `isWeekend`, `streakNorm`, `habitAgeNorm` | Context. |
+
+### The shrinkage that mattered
+
+`historical_rate.py` shrinks each hour's rate toward a 0.5 prior with `k = 5`. Without it, an hour
+whose only nearby attempt carries a kernel weight of ~1e-7 returns 0.0 or 1.0 at full confidence —
+and since the recommender takes an argmax across 17 hours, whichever thinly-evidenced hour got a
+lucky success wins every time. A textbook winner's curse. Adding shrinkage roughly halved mean
+regret and took within-1h accuracy from ~37% to ~64%.
+
+## Evaluation
+
+Two things are reported that a plain accuracy figure would hide.
+
+**Every metric is printed next to its do-nothing floor.** On a 61%-positive target, an "always
+predict success" classifier scores 61% accuracy and 75.8% F1 — numbers that look respectable and
+mean nothing. Printing them side by side makes an uninformative model impossible to present as a
+good one. ROC AUC and Brier skill are also reported because the deployed model never applies a 0.5
+threshold: it only ranks hours against each other.
+
+**The model is evaluated on the job it actually does** — picking one hour out of seventeen — against
+four rival policies on 1,500 users it never saw, including "just use the user's own preferred time".
+The model is allowed to lose. The acceptance criterion was fixed before running:
+
+> Keep the ML path only if the model beats **both** the historical-rate policy and the
+> preferred-hour policy on held-out mean regret. If it does not, ship the rule-based path and
+> report the negative result.
+
+### Current figures
+
+Regenerated by `npm run train`; the exact values live in the header of `weights.generated.ts`.
+
+| Validation (8,000 rows, 200 unseen users) | Model | Floor |
+|---|---|---|
+| Accuracy | 73.0% | 61.0% (always-yes) |
+| F1 | 80.6% | 75.8% (always-yes) |
+| ROC AUC | 0.750 | 0.500 (chance) |
+| Brier skill | 0.222 | 0.000 |
+| **Bayes ceiling** | — | **73.4%** |
+
+Accuracy sits 0.4 points below the Bayes ceiling — the model captures roughly 97% of the headroom
+that exists between the baseline and what an oracle knowing the generator's own probabilities
+could achieve.
+
+| Top-1 hour, 1,500 held-out users | Mean regret | Exact | Within 1h |
+|---|---|---|---|
+| **Trained model** | **6.18** | **54.5%** | **92.9%** |
+| argmax(historical rate) | 10.73 | 36.1% | 72.2% |
+| User's preferred hour | 10.14 | 34.2% | 74.3% |
+| Random hour | 39.11 | 6.3% | 18.1% |
+| Fixed 06:00 | 49.09 | 0.0% | 17.3% |
+
+Criterion **met** — the model beats both baselines.
+
+## Limitations, stated plainly
+
+- **All training data is synthetic.** Every figure above measures how well the pipeline recovers a
+  relationship `synthetic_data.py` encodes. It is evidence that the learning pipeline works, not
+  evidence about real human behaviour. No real user data was used.
+- The Bayes ceiling is only meaningful *relative to that same generator*.
+- The model is linear. It cannot represent interactions beyond what the feature engineering makes
+  explicit — a deliberate trade for on-device inference with no ML runtime.
+- Cold start is handled by the shipped weights plus the shrinkage prior, but a habit with fewer
+  than 3 logged attempts gets **no confidence figure at all** in the UI, because at that point the
+  model's output is dominated by the prior rather than by that user's data.

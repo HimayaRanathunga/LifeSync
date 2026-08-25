@@ -8,13 +8,13 @@ import {
   Animated,
   Easing,
   Modal,
+  Alert,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../../context/AuthContext';
 import { useTheme } from '../../context/ThemeContext';
-import { subscribeToRecommendations } from '../../services/recommendationsService';
 import { subscribeToHabits } from '../../services/habitsService';
 import { getCurrentWeather, weatherTip } from '../../services/weatherService';
 import { subscribeToTodayFoodLogs } from '../../services/foodService';
@@ -22,79 +22,27 @@ import {
   incrementWaterMl,
   subscribeToTodayHealthLog,
   fetchRecentHabitLogs,
-  logHabitCompletion,
+  subscribeToHabitLogs,
 } from '../../services/logsService';
 import { subscribeToUserProfile } from '../../services/profileService';
-import { useTodaySteps } from '../../hooks/useTodaySteps';
+import { useTodayStepsState } from '../../hooks/useTodaySteps';
 import { useHeartRate } from '../../hooks/useHeartRate';
-import { DEFAULT_DAILY_GOALS } from '../../constants/goals';
+import { DEFAULT_DAILY_GOALS, deriveMacroTargets, positiveGoalOr } from '../../constants/goals';
 import { TAB_BAR_CLEARANCE } from '../../constants/layout';
+import { toDateKey } from '../../utils/dates';
+import { estimateActiveBurnKcal, estimateDistanceKm } from '../../utils/activity';
+import { buildDashboardAlerts } from '../../utils/dashboardAlerts';
+import { recommendForHabits, MIN_ATTEMPTS_FOR_CONFIDENCE } from '../../ml/recommender';
+import { syncHabitReminders, disableHabitReminders } from '../../services/notificationsService';
 import CircularProgressRing from '../../components/CircularProgressRing';
-import type { DailyGoals, FoodLog, HealthLog, Habit, Recommendation } from '../../types';
-
-interface FakeNotification {
-  id: string;
-  title: string;
-  message: string;
-  time: string;
-  icon: keyof typeof Ionicons.glyphMap;
-  color: string;
-  bg: string;
-  read: boolean;
-}
-
-const INITIAL_NOTIFICATIONS: FakeNotification[] = [
-  {
-    id: 'n1',
-    title: 'Hydration Milestone',
-    message: 'Drink 250ml water now to maintain your peak hydration streak!',
-    time: '10m ago',
-    icon: 'water',
-    color: '#0284C7',
-    bg: '#E0F2FE',
-    read: false,
-  },
-  {
-    id: 'n2',
-    title: 'Meal Log Reminder',
-    message: 'Remember to scan your lunch to evaluate Sri Lankan veggie nutrients & habits.',
-    time: '1h ago',
-    icon: 'restaurant',
-    color: '#059669',
-    bg: '#D1FAE5',
-    read: false,
-  },
-  {
-    id: 'n3',
-    title: '5-Day Habit Streak!',
-    message: 'Awesome consistency! You have completed 100% of your morning habits.',
-    time: '3h ago',
-    icon: 'flame',
-    color: '#EA580C',
-    bg: '#FFEDD5',
-    read: false,
-  },
-  {
-    id: 'n4',
-    title: 'Daily Steps Goal: 68%',
-    message: '6,840 steps completed today. Just 3,160 steps left to hit 10,000!',
-    time: '5h ago',
-    icon: 'footsteps',
-    color: '#7C3AED',
-    bg: '#EDE9FE',
-    read: true,
-  },
-  {
-    id: 'n5',
-    title: 'Sleep Recovery Ready',
-    message: 'Your optimal bedtime tonight is 10:30 PM for 8 hours of restorative sleep.',
-    time: 'Yesterday',
-    icon: 'moon',
-    color: '#4F46E5',
-    bg: '#E0E7FF',
-    read: true,
-  },
-];
+import type {
+  DailyGoals,
+  FoodLog,
+  HealthLog,
+  Habit,
+  HabitLog,
+  UserProfile,
+} from '../../types';
 
 function getTimeGreeting(): { greeting: string; icon: keyof typeof Ionicons.glyphMap } {
   const hour = new Date().getHours();
@@ -108,42 +56,120 @@ export default function DashboardScreen() {
   const { isDark } = useTheme();
   const insets = useSafeAreaInsets();
   const navigation = useNavigation<any>();
-  const today = new Date().toISOString().slice(0, 10);
+  const today = toDateKey();
 
-  const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
   const [habits, setHabits] = useState<Habit[]>([]);
+  const [habitLogs, setHabitLogs] = useState<HabitLog[] | null>(null);
   const [weatherMessage, setWeatherMessage] = useState<string | null>(null);
   const [todayFoodLogs, setTodayFoodLogs] = useState<FoodLog[]>([]);
   const [todayHealthLog, setTodayHealthLog] = useState<HealthLog | null>(null);
   const [goals, setGoals] = useState<DailyGoals>(DEFAULT_DAILY_GOALS);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
   const [displayName, setDisplayName] = useState<string>('');
   const [completedTodayIds, setCompletedTodayIds] = useState<Set<string>>(new Set());
-  
-  // Notification Modal State
-  const [notifications, setNotifications] = useState<FakeNotification[]>(INITIAL_NOTIFICATIONS);
-  const [showNotificationsModal, setShowNotificationsModal] = useState(false);
 
-  const steps = useTodaySteps(user?.uid) || 6840;
+  // Firestore subscriptions deliver `[]`/`null` both before the first snapshot arrives and when
+  // the user genuinely has nothing logged. These flags separate the two so a real zero renders as
+  // "0" while a still-loading value renders as "—".
+  const [foodLoaded, setFoodLoaded] = useState(false);
+  const [healthLoaded, setHealthLoaded] = useState(false);
+
+  const stepsState = useTodayStepsState(user?.uid);
+  const steps = stepsState.status === 'ready' ? stepsState.steps : null;
   const heartScale = useRef(new Animated.Value(1)).current;
   const bpm = useHeartRate();
 
-  const loggedCalories = todayFoodLogs.reduce((sum, log) => sum + log.totalCalories, 0);
-  const todayCalories = loggedCalories > 0 ? loggedCalories : 2145;
-  const targetCalories = goals.calorieTarget || 2665;
-  const caloriesLeft = Math.max(0, targetCalories - todayCalories) || 520;
-  const calorieProgress = Math.min(1, todayCalories / targetCalories);
+  // Targets are guarded rather than defaulted with `||`: the Settings editor does not validate its
+  // input, so a negative target can already exist in a user document, and passing one through
+  // would render a negative-width progress arc.
+  const targetCalories = positiveGoalOr(goals.calorieTarget, DEFAULT_DAILY_GOALS.calorieTarget);
+  const targetWater = positiveGoalOr(goals.waterTargetMl, DEFAULT_DAILY_GOALS.waterTargetMl);
+  const targetSteps = positiveGoalOr(goals.stepTarget, DEFAULT_DAILY_GOALS.stepTarget);
 
-  // Macros Calculation
-  const totalCarbs = todayFoodLogs.reduce((sum, log) => sum + (log.macros?.carbsGrams || 0), 0) || 231;
-  const totalProtein = todayFoodLogs.reduce((sum, log) => sum + (log.macros?.proteinGrams || 0), 0) || 51;
-  const totalFat = todayFoodLogs.reduce((sum, log) => sum + (log.macros?.fatGrams || 0), 0) || 131;
+  // `?? 0` throughout, never `|| n`: zero is the truthful answer for a day with nothing logged,
+  // and `||` would silently replace it with a placeholder.
+  const todayCalories = todayFoodLogs.reduce((sum, log) => sum + (log.totalCalories ?? 0), 0);
+  const caloriesLeft = Math.max(0, targetCalories - todayCalories);
+  const calorieProgress = Math.min(1, Math.max(0, todayCalories / targetCalories));
 
-  const targetCarbs = 412;
-  const targetProtein = 132;
-  const targetFat = 180;
+  const totalCarbs = todayFoodLogs.reduce((sum, log) => sum + (log.macros?.carbsGrams ?? 0), 0);
+  const totalProtein = todayFoodLogs.reduce((sum, log) => sum + (log.macros?.proteinGrams ?? 0), 0);
+  const totalFat = todayFoodLogs.reduce((sum, log) => sum + (log.macros?.fatGrams ?? 0), 0);
 
-  const todayWater = todayHealthLog?.waterMl ?? 1750;
-  const unreadCount = notifications.filter((n) => !n.read).length;
+  // Derived from the user's own calorie target so the two can never disagree — the previous
+  // hardcoded 412/132/180 summed to 3,796 kcal against a stated 2,665 target.
+  const macroTargets = useMemo(() => deriveMacroTargets(targetCalories), [targetCalories]);
+
+  const todayWater = healthLoaded ? todayHealthLog?.waterMl ?? 0 : null;
+
+  const stepGoalPct =
+    steps === null ? null : Math.min(100, Math.round((steps / targetSteps) * 100));
+  const activeBurnKcal = steps === null ? null : estimateActiveBurnKcal(steps, profile?.weightKg);
+  const distanceKm = steps === null ? null : estimateDistanceKm(steps, profile?.heightCm);
+
+  const habitsDoneToday = completedTodayIds.size;
+
+  /**
+   * Recommendations are computed on-device from the trained model (src/ml/), not read from
+   * Firestore. The Cloud Function that used to produce them requires a Blaze plan and a deploy
+   * step, so in practice the collection was always empty and this section had nothing to show.
+   * Running the model locally means suggestions appear as soon as there are habits, work with no
+   * network, and update the moment a completion is logged.
+   */
+  const liveRecommendations = useMemo(
+    () => (habitLogs === null ? [] : recommendForHabits(habits, habitLogs, profile)),
+    [habits, habitLogs, profile]
+  );
+  const recsLoaded = habitLogs !== null;
+
+  // Derived from the day's real logged state — see utils/dashboardAlerts.ts.
+  const alerts = useMemo(
+    () =>
+      buildDashboardAlerts({
+        steps,
+        stepTarget: targetSteps,
+        waterMl: todayWater,
+        waterTargetMl: targetWater,
+        caloriesLogged: todayCalories,
+        calorieTarget: targetCalories,
+        foodLogCount: todayFoodLogs.length,
+        habitsTotal: habits.length,
+        habitsDone: habitsDoneToday,
+        hour: new Date().getHours(),
+      }),
+    [
+      steps,
+      targetSteps,
+      todayWater,
+      targetWater,
+      todayCalories,
+      targetCalories,
+      todayFoodLogs.length,
+      habits.length,
+      habitsDoneToday,
+    ]
+  );
+  const [showAlertsModal, setShowAlertsModal] = useState(false);
+
+  /**
+   * Keeps the OS-scheduled reminders in step with the model's current suggestions. This is the
+   * "adaptive" half of adaptive notifications: as logged completions shift what the model
+   * recommends, the reminder times move with them.
+   *
+   * Before this the whole notifications service had no call sites at all, so no reminder was ever
+   * scheduled despite the feature being documented as working.
+   */
+  useEffect(() => {
+    if (!user || habitLogs === null || habits.length === 0) return;
+    // undefined means the setting predates the toggle, and the original behaviour was on.
+    if (profile?.notificationsEnabled === false) {
+      disableHabitReminders().catch(() => {});
+      return;
+    }
+    syncHabitReminders(liveRecommendations, habits).catch((err) =>
+      console.warn('[notifications] reminder sync failed:', err)
+    );
+  }, [user, habitLogs, habits, liveRecommendations, profile?.notificationsEnabled]);
 
   useEffect(() => {
     const heartbeat = Animated.loop(
@@ -183,28 +209,56 @@ export default function DashboardScreen() {
   }, [heartScale]);
 
   useEffect(() => {
-    if (!user) return;
+    // A signed-out render must not spin forever waiting for snapshots that will never arrive.
+    if (!user) {
+      setFoodLoaded(true);
+      setHealthLoaded(true);
+      setHabitLogs([]);
+      return;
+    }
+    setFoodLoaded(false);
+    setHealthLoaded(false);
+    setHabitLogs(null);
+
     const unsubProfile = subscribeToUserProfile(user.uid, (p) => {
+      console.log(
+        '[profile] uid=', user.uid,
+        '| snapshot=', p === null ? 'DOC MISSING' : 'ok',
+        '| heightCm=', p?.heightCm,
+        '| weightKg=', p?.weightKg
+      );
+      setProfile(p);
       if (p?.displayName) setDisplayName(p.displayName);
       if (p?.dailyGoals) setGoals(p.dailyGoals);
     });
-    const unsubRecs = subscribeToRecommendations(user.uid, setRecommendations);
+    // Feeds the on-device recommender, so a new completion re-scores the habit immediately.
+    const unsubLogs = subscribeToHabitLogs(user.uid, setHabitLogs);
     const unsubHabits = subscribeToHabits(user.uid, setHabits);
-    const unsubFood = subscribeToTodayFoodLogs(user.uid, today, setTodayFoodLogs);
-    const unsubHealth = subscribeToTodayHealthLog(user.uid, today, setTodayHealthLog);
+    const unsubFood = subscribeToTodayFoodLogs(user.uid, today, (logs) => {
+      setTodayFoodLogs(logs);
+      setFoodLoaded(true);
+    });
+    const unsubHealth = subscribeToTodayHealthLog(user.uid, today, (log) => {
+      setTodayHealthLog(log);
+      setHealthLoaded(true);
+    });
 
     getCurrentWeather().then((w) => {
       if (w) setWeatherMessage(weatherTip(w));
     });
 
-    fetchRecentHabitLogs(user.uid, today).then((logs) => {
-      const done = new Set(logs.filter((l) => l.success && l.date === today).map((l) => l.habitId));
-      setCompletedTodayIds(done);
-    });
+    fetchRecentHabitLogs(user.uid, today)
+      .then((logs) => {
+        const done = new Set(
+          logs.filter((l) => l.success && l.date === today).map((l) => l.habitId)
+        );
+        setCompletedTodayIds(done);
+      })
+      .catch(() => setCompletedTodayIds(new Set()));
 
     return () => {
       unsubProfile();
-      unsubRecs();
+      unsubLogs();
       unsubHabits();
       unsubFood();
       unsubHealth();
@@ -213,11 +267,18 @@ export default function DashboardScreen() {
 
   const handleQuickAddWater = async (amount: number) => {
     if (!user) return;
-    await incrementWaterMl(user.uid, today, amount);
-  };
-
-  const markAllNotificationsRead = () => {
-    setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+    console.log('[water] +', amount, 'ml -> users/' + user.uid + '/healthLogs/' + today);
+    try {
+      await incrementWaterMl(user.uid, today, amount);
+      console.log('[water] write confirmed by server');
+    } catch (err: any) {
+      console.warn('[water] write FAILED:', err?.code, err?.message);
+      // Without this the button silently does nothing when the write is rejected. Firestore
+      // applies the increment to the local snapshot straight away, so an offline tap still
+      // updates the number here and syncs when the connection returns — this alert is for a
+      // genuine failure (rules, signed-out session), not for being offline.
+      Alert.alert('Could not save', 'Your water intake was not recorded. Please try again.');
+    }
   };
 
   const { greeting, icon } = getTimeGreeting();
@@ -433,6 +494,13 @@ export default function DashboardScreen() {
           color: isDark ? '#94A3B8' : '#64748B',
           fontWeight: '600',
         },
+        fitnessHintText: {
+          fontSize: 11,
+          color: '#3B82F6',
+          fontWeight: '700',
+          textAlign: 'center',
+          marginTop: 10,
+        },
 
         // Vitals Grid (Hydration & Heart Rate)
         vitalGrid: {
@@ -515,16 +583,26 @@ export default function DashboardScreen() {
           borderRadius: 18,
           padding: 16,
           gap: 8,
+          // Meal titles vary a lot in length once they come from real scans rather than the two
+          // fixed strings this row used to hold; a floor keeps a one-line card the same height as
+          // a two-line one so the row never looks half-collapsed.
+          minHeight: 86,
+          justifyContent: 'space-between',
         },
         compactMealTop: {
           flexDirection: 'row',
-          alignItems: 'center',
+          alignItems: 'flex-start',
           justifyContent: 'space-between',
+          gap: 6,
         },
         compactMealTitle: {
-          fontSize: 14,
+          fontSize: 13,
           fontWeight: '800',
-          color: '#0F172A',
+          color: isDark ? '#F8FAFC' : '#0F172A',
+          // Without flex the title pushed the icon off the card once meal names came from real
+          // scans instead of the two short fixed strings this row used to show.
+          flex: 1,
+          lineHeight: 17,
         },
         compactMealCals: {
           fontSize: 12,
@@ -624,11 +702,14 @@ export default function DashboardScreen() {
 
           <Pressable
             style={styles.bellButton}
-            onPress={() => setShowNotificationsModal(true)}
+            onPress={() => setShowAlertsModal(true)}
             accessibilityRole="button"
+            accessibilityLabel={
+              alerts.length > 0 ? `${alerts.length} daily alerts` : 'Daily alerts'
+            }
           >
             <Ionicons name="notifications-outline" size={20} color={isDark ? '#F8FAFC' : '#0F172A'} />
-            {unreadCount > 0 ? <View style={styles.badgeDot} /> : null}
+            {alerts.length > 0 ? <View style={styles.badgeDot} /> : null}
           </Pressable>
         </View>
 
@@ -663,7 +744,7 @@ export default function DashboardScreen() {
               </View>
               <View>
                 <Text style={styles.macroLabelText}>Carbs</Text>
-                <Text style={styles.macroValueText}>{totalCarbs} /{targetCarbs}</Text>
+                <Text style={styles.macroValueText}>{totalCarbs} /{macroTargets.carbsGrams}</Text>
               </View>
             </View>
 
@@ -674,7 +755,7 @@ export default function DashboardScreen() {
               </View>
               <View>
                 <Text style={styles.macroLabelText}>Protein</Text>
-                <Text style={styles.macroValueText}>{totalProtein} /{targetProtein}</Text>
+                <Text style={styles.macroValueText}>{totalProtein} /{macroTargets.proteinGrams}</Text>
               </View>
             </View>
 
@@ -685,7 +766,7 @@ export default function DashboardScreen() {
               </View>
               <View>
                 <Text style={styles.macroLabelText}>Fat</Text>
-                <Text style={styles.macroValueText}>{totalFat} /{targetFat}</Text>
+                <Text style={styles.macroValueText}>{totalFat} /{macroTargets.fatGrams}</Text>
               </View>
             </View>
           </View>
@@ -705,34 +786,64 @@ export default function DashboardScreen() {
               <View style={[styles.fitnessStatIcon, { backgroundColor: '#EDE9FE' }]}>
                 <Ionicons name="footsteps" size={18} color="#7C3AED" />
               </View>
-              <Text style={styles.fitnessStatValue}>{steps.toLocaleString()}</Text>
-              <Text style={styles.fitnessStatLabel}>Steps Today</Text>
+              <Text style={styles.fitnessStatValue}>
+                {steps === null ? '—' : steps.toLocaleString()}
+              </Text>
+              <Text style={styles.fitnessStatLabel}>
+                {stepsState.status === 'unavailable'
+                  ? stepsState.reason === 'permission-denied'
+                    ? 'Steps denied'
+                    : 'No pedometer'
+                  : 'Steps Today'}
+              </Text>
             </View>
 
             <View style={styles.fitnessStatItem}>
               <View style={[styles.fitnessStatIcon, { backgroundColor: '#FFEDD5' }]}>
                 <Ionicons name="flame" size={18} color="#EA580C" />
               </View>
-              <Text style={styles.fitnessStatValue}>480 kcal</Text>
-              <Text style={styles.fitnessStatLabel}>Active Burn</Text>
+              <Text style={styles.fitnessStatValue}>
+                {activeBurnKcal === null ? '—' : `${activeBurnKcal} kcal`}
+              </Text>
+              <Text style={styles.fitnessStatLabel}>Est. Burn</Text>
             </View>
 
             <View style={styles.fitnessStatItem}>
               <View style={[styles.fitnessStatIcon, { backgroundColor: '#E0F2FE' }]}>
                 <Ionicons name="navigate" size={18} color="#0284C7" />
               </View>
-              <Text style={styles.fitnessStatValue}>4.8 km</Text>
-              <Text style={styles.fitnessStatLabel}>Distance</Text>
+              <Text style={styles.fitnessStatValue}>
+                {distanceKm === null ? '—' : `${distanceKm.toFixed(1)} km`}
+              </Text>
+              <Text style={styles.fitnessStatLabel}>Est. Distance</Text>
             </View>
 
+            {/*
+              Replaces a hardcoded "45 min Active Time". Expo's Pedometer exposes only a cumulative
+              step delta with no timestamps, so active minutes cannot be derived — step-goal
+              progress is the honest metric this tile can actually report.
+            */}
             <View style={styles.fitnessStatItem}>
               <View style={[styles.fitnessStatIcon, { backgroundColor: '#DCFCE7' }]}>
-                <Ionicons name="time" size={18} color="#059669" />
+                <Ionicons name="trophy" size={18} color="#059669" />
               </View>
-              <Text style={styles.fitnessStatValue}>45 min</Text>
-              <Text style={styles.fitnessStatLabel}>Active Time</Text>
+              <Text style={styles.fitnessStatValue}>
+                {stepGoalPct === null ? '—' : `${stepGoalPct}%`}
+              </Text>
+              <Text style={styles.fitnessStatLabel}>Step Goal</Text>
             </View>
           </View>
+
+          {(activeBurnKcal === null || distanceKm === null) && steps !== null ? (
+            <Pressable
+              onPress={() => navigation.navigate('Food', { screen: 'FoodHealthDetail' })}
+              accessibilityRole="button"
+            >
+              <Text style={styles.fitnessHintText}>
+                Add your height & weight to see distance and burn estimates
+              </Text>
+            </Pressable>
+          ) : null}
         </View>
 
         {/* Daily Vitals Grid (Hydration & Heart Rate) */}
@@ -751,10 +862,12 @@ export default function DashboardScreen() {
               <Ionicons name="water" size={18} color="#0284C7" />
             </View>
             <View style={styles.vitalValueRow}>
-              <Text style={styles.vitalValue}>{todayWater}</Text>
+              <Text style={styles.vitalValue}>
+                {todayWater === null ? '—' : todayWater.toLocaleString()}
+              </Text>
               <Text style={styles.vitalUnitText}>ml</Text>
             </View>
-            <Text style={styles.vitalSub}>Target: {goals.waterTargetMl} ml</Text>
+            <Text style={styles.vitalSub}>Target: {targetWater.toLocaleString()} ml</Text>
             <View style={styles.quickWaterRow}>
               <Pressable style={styles.quickWaterBtn} onPress={() => handleQuickAddWater(250)}>
                 <Text style={styles.quickWaterText}>+250ml</Text>
@@ -765,7 +878,13 @@ export default function DashboardScreen() {
             </View>
           </View>
 
-          {/* Heart Rate Card */}
+          {/*
+            Heart rate is simulated — Expo exposes no HR sensor without HealthKit/Health Connect
+            or a BLE wearable, none of which are available in a managed Expo Go build. The value
+            is labelled SIMULATED in the UI so it can never be mistaken for a measurement, and
+            the verdict below is derived from the displayed number rather than asserted.
+            See src/services/heartRateService.ts.
+          */}
           <View style={styles.vitalCard}>
             <View style={styles.vitalHeader}>
               <Text style={styles.vitalTitle}>Heart Rate</Text>
@@ -777,10 +896,22 @@ export default function DashboardScreen() {
               <Text style={styles.vitalValue}>{bpm}</Text>
               <Text style={styles.vitalUnitText}>BPM</Text>
             </View>
-            <Text style={styles.vitalSub}>Optimal Resting Pulse</Text>
+            <Text style={styles.vitalSub}>Simulated — no HR sensor</Text>
             <View style={[styles.quickWaterRow, { marginTop: 10, flexDirection: 'row', alignItems: 'center', gap: 4 }]}>
-              <Ionicons name="checkmark-circle" size={13} color="#10B981" />
-              <Text style={{ fontSize: 11, color: '#10B981', fontWeight: '800' }}>100% Healthy</Text>
+              <Ionicons
+                name={bpm >= 60 && bpm <= 100 ? 'checkmark-circle' : 'alert-circle'}
+                size={13}
+                color={bpm >= 60 && bpm <= 100 ? '#10B981' : '#EA580C'}
+              />
+              <Text
+                style={{
+                  fontSize: 11,
+                  color: bpm >= 60 && bpm <= 100 ? '#10B981' : '#EA580C',
+                  fontWeight: '800',
+                }}
+              >
+                {bpm >= 60 && bpm <= 100 ? 'Within resting range' : 'Outside resting range'}
+              </Text>
             </View>
           </View>
         </View>
@@ -798,11 +929,16 @@ export default function DashboardScreen() {
         </View>
 
         <View style={{ gap: 10, marginBottom: 18 }}>
-          {recommendations.length > 0 ? (
-            recommendations.slice(0, 3).map((rec, index) => {
-              const matchedHabit = habits.find((h) => h.id === rec.habitId);
-              const title = matchedHabit?.title || 'Daily Habit Session';
-              const confidence = Math.round((rec.score || 0.85) * 100);
+          {liveRecommendations.length > 0 ? (
+            liveRecommendations.slice(0, 3).map((rec, index) => {
+              // Orphans are filtered out above, so the habit is guaranteed to resolve — no
+              // invented placeholder title.
+              const matchedHabit = habits.find((h) => h.id === rec.habitId)!;
+              const title = matchedHabit.title;
+              // null below MIN_ATTEMPTS_FOR_CONFIDENCE logged attempts: with almost no history the
+              // model's output is the prior, and printing it as a percentage would present an
+              // absence of evidence as a measurement.
+              const confidence = rec.confidence === null ? null : Math.round(rec.confidence * 100);
 
               return (
                 <View
@@ -824,9 +960,11 @@ export default function DashboardScreen() {
                       <Text style={{ fontSize: 14, fontWeight: '800', color: isDark ? '#F8FAFC' : '#0F172A' }}>
                         {title}
                       </Text>
-                      <View style={{ backgroundColor: '#ECFDF5', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6 }}>
-                        <Text style={{ fontSize: 10, fontWeight: '800', color: '#059669' }}>
-                          {confidence}% Peak
+                      <View style={{ backgroundColor: confidence === null ? '#F1F5F9' : '#ECFDF5', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6 }}>
+                        <Text style={{ fontSize: 10, fontWeight: '800', color: confidence === null ? '#64748B' : '#059669' }}>
+                          {confidence === null
+                            ? `${rec.attempts}/${MIN_ATTEMPTS_FOR_CONFIDENCE} logs`
+                            : `${confidence}% likely`}
                         </Text>
                       </View>
                     </View>
@@ -857,139 +995,150 @@ export default function DashboardScreen() {
               style={{
                 backgroundColor: isDark ? '#1E293B' : '#F8FAFC',
                 borderRadius: 18,
-                padding: 14,
+                padding: 16,
                 borderWidth: 1,
                 borderColor: isDark ? '#334155' : '#E2E8F0',
-                gap: 8,
+                gap: 6,
               }}
             >
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
-                <View style={{ width: 34, height: 34, borderRadius: 17, backgroundColor: '#E0E7FF', alignItems: 'center', justifyContent: 'center' }}>
-                  <Ionicons name="sunny-outline" size={18} color="#4F46E5" />
-                </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={{ fontSize: 13, fontWeight: '800', color: isDark ? '#F8FAFC' : '#0F172A' }} numberOfLines={1}>
-                    Morning Hydration & Sunlight Walk
-                  </Text>
-                  <Text style={{ fontSize: 11, color: '#64748B', marginTop: 1 }} numberOfLines={1}>
-                    07:30 AM · Circadian Cortisol Peak
-                  </Text>
-                </View>
-                <View style={{ backgroundColor: '#ECFDF5', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8 }}>
-                  <Text style={{ fontSize: 10, fontWeight: '800', color: '#059669' }}>94% Success</Text>
-                </View>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                <Ionicons name="sparkles-outline" size={18} color="#6366F1" />
+                <Text style={{ fontSize: 14, fontWeight: '800', color: isDark ? '#F8FAFC' : '#0F172A' }}>
+                  {recsLoaded ? 'No recommendations yet' : 'Loading recommendations'}
+                </Text>
               </View>
-
-              <View
-                style={{
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  gap: 10,
-                  borderTopWidth: 1,
-                  borderTopColor: isDark ? '#334155' : '#F1F5F9',
-                  paddingTop: 12,
-                }}
-              >
-                <View style={{ width: 34, height: 34, borderRadius: 17, backgroundColor: '#FEF3C7', alignItems: 'center', justifyContent: 'center' }}>
-                  <Ionicons name="book-outline" size={18} color="#D97706" />
-                </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={{ fontSize: 13, fontWeight: '800', color: isDark ? '#F8FAFC' : '#0F172A' }} numberOfLines={1}>
-                    Deep Focus Study & Learning
-                  </Text>
-                  <Text style={{ fontSize: 11, color: '#64748B', marginTop: 1 }} numberOfLines={1}>
-                    08:30 PM · Evening Alpha Waves
+              <Text style={{ fontSize: 12, color: '#64748B', lineHeight: 17 }}>
+                {!recsLoaded
+                  ? '—'
+                  : habits.length === 0
+                    ? 'Add a habit and log a few days — the model needs history before it can suggest a time.'
+                    : 'Recommendations refresh nightly once you have logged a few completions.'}
+              </Text>
+              {weatherMessage ? (
+                <View style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 5, marginTop: 2 }}>
+                  <Ionicons name="partly-sunny-outline" size={13} color="#0284C7" style={{ marginTop: 1 }} />
+                  <Text style={{ flex: 1, fontSize: 11, color: '#0284C7', lineHeight: 16, fontWeight: '600' }}>
+                    {weatherMessage}
                   </Text>
                 </View>
-                <View style={{ backgroundColor: '#ECFDF5', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8 }}>
-                  <Text style={{ fontSize: 10, fontWeight: '800', color: '#059669' }}>91% Success</Text>
-                </View>
-              </View>
+              ) : null}
+              {habits.length > 0 ? (
+                <Text style={{ fontSize: 11, color: '#64748B', fontWeight: '700', marginTop: 2 }}>
+                  {habitsDoneToday}/{habits.length} habits completed today
+                </Text>
+              ) : null}
             </View>
           )}
         </View>
 
-        {/* Compact Meal Suggest Section */}
-
+        {/* Today's logged meals. FoodLog has no meal-slot field, so breakfast/lunch cannot be
+            reconstructed — the previous "Sandwich / Red Rice" cards were invented. This shows what
+            the user actually scanned, or an honest prompt when nothing is logged. */}
         <View style={styles.sectionTitleRow}>
-          <Text style={styles.sectionTitle}>Meal Suggest</Text>
+          <Text style={styles.sectionTitle}>Today's Meals</Text>
           <Pressable onPress={() => navigation.navigate('Food')}>
             <Text style={styles.seeAllText}>Scan Meal</Text>
           </Pressable>
         </View>
 
         <View style={styles.compactMealRow}>
-          {/* Breakfast */}
-          <Pressable
-            style={[styles.compactMealCard, { backgroundColor: isDark ? '#1E293B' : '#EAF4FD' }]}
-            onPress={() => navigation.navigate('Food')}
-          >
-            <View style={styles.compactMealTop}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                <Ionicons name="cafe" size={15} color="#0284C7" />
-                <Text style={styles.compactMealTitle}>Breakfast</Text>
+          {todayFoodLogs.length > 0 ? (
+            todayFoodLogs.slice(0, 2).map((log, i) => (
+              <Pressable
+                key={log.id ?? i}
+                style={[
+                  styles.compactMealCard,
+                  { backgroundColor: isDark ? '#1E293B' : i === 0 ? '#EAF4FD' : '#F2ECFE' },
+                ]}
+                onPress={() => navigation.navigate('Food')}
+              >
+                <View style={styles.compactMealTop}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                    <Ionicons name="restaurant" size={15} color={i === 0 ? '#0284C7' : '#7C3AED'} />
+                    <Text style={styles.compactMealTitle} numberOfLines={2}>
+                      {log.mealTitle || 'Scanned meal'}
+                    </Text>
+                  </View>
+                </View>
+                <Text style={styles.compactMealCals}>
+                  {(log.totalCalories ?? 0).toLocaleString()} kcal
+                </Text>
+              </Pressable>
+            ))
+          ) : (
+            <Pressable
+              style={[
+                styles.compactMealCard,
+                { flex: 1, backgroundColor: isDark ? '#1E293B' : '#EAF4FD' },
+              ]}
+              onPress={() => navigation.navigate('Food')}
+            >
+              <View style={styles.compactMealTop}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                  <Ionicons name="camera-outline" size={15} color="#0284C7" />
+                  <Text style={styles.compactMealTitle}>
+                    {foodLoaded ? 'No meals logged yet' : '—'}
+                  </Text>
+                </View>
+                <Ionicons name="add-circle" size={20} color="#0284C7" />
               </View>
-              <Ionicons name="add-circle" size={20} color="#0284C7" />
-            </View>
-            <Text style={styles.compactMealCals}>Sandwich · 344 kcal</Text>
-          </Pressable>
-
-          {/* Lunch */}
-          <Pressable
-            style={[styles.compactMealCard, { backgroundColor: isDark ? '#1E293B' : '#F2ECFE' }]}
-            onPress={() => navigation.navigate('Food')}
-          >
-            <View style={styles.compactMealTop}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                <Ionicons name="restaurant" size={15} color="#7C3AED" />
-                <Text style={styles.compactMealTitle}>Lunch</Text>
-              </View>
-              <Ionicons name="add-circle" size={20} color="#7C3AED" />
-            </View>
-            <Text style={styles.compactMealCals}>Red Rice · 320 kcal</Text>
-          </Pressable>
+              <Text style={styles.compactMealCals}>
+                {foodLoaded ? 'Tap to scan a meal' : ''}
+              </Text>
+            </Pressable>
+          )}
         </View>
 
       </ScrollView>
 
-      {/* Interactive Notifications Bottom Sheet Modal */}
+      {/* Daily alerts, derived from today's real logged state (utils/dashboardAlerts.ts).
+          There is no read/unread state because these describe the current day, not past events. */}
       <Modal
-        visible={showNotificationsModal}
+        visible={showAlertsModal}
         transparent
         animationType="slide"
-        onRequestClose={() => setShowNotificationsModal(false)}
+        onRequestClose={() => setShowAlertsModal(false)}
       >
-        <Pressable style={styles.modalOverlay} onPress={() => setShowNotificationsModal(false)}>
+        <Pressable style={styles.modalOverlay} onPress={() => setShowAlertsModal(false)}>
           <Pressable style={styles.modalSheet} onPress={(e) => e.stopPropagation()}>
             <View style={styles.modalHeader}>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                <Text style={styles.modalTitle}>Notifications</Text>
-                {unreadCount > 0 ? (
-                  <View style={{ backgroundColor: '#EF4444', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 10 }}>
-                    <Text style={{ color: '#FFFFFF', fontSize: 10, fontWeight: '800' }}>{unreadCount} New</Text>
+                <Text style={styles.modalTitle}>Today</Text>
+                {alerts.length > 0 ? (
+                  <View style={{ backgroundColor: '#6366F1', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 10 }}>
+                    <Text style={{ color: '#FFFFFF', fontSize: 10, fontWeight: '800' }}>
+                      {alerts.length}
+                    </Text>
                   </View>
                 ) : null}
               </View>
-              <Pressable onPress={markAllNotificationsRead}>
-                <Text style={{ color: '#3B82F6', fontSize: 13, fontWeight: '700' }}>Mark all read</Text>
+              <Pressable onPress={() => setShowAlertsModal(false)} accessibilityRole="button">
+                <Text style={{ color: '#3B82F6', fontSize: 13, fontWeight: '700' }}>Done</Text>
               </Pressable>
             </View>
 
             <ScrollView showsVerticalScrollIndicator={false}>
-              {notifications.map((n) => (
-                <View key={n.id} style={styles.notifItem}>
-                  <View style={[styles.notifIconBox, { backgroundColor: n.bg }]}>
-                    <Ionicons name={n.icon} size={20} color={n.color} />
-                  </View>
-                  <View style={styles.notifContent}>
-                    <View style={styles.notifTitleRow}>
-                      <Text style={styles.notifTitle}>{n.title}</Text>
-                      <Text style={styles.notifTime}>{n.time}</Text>
-                    </View>
-                    <Text style={styles.notifMessage}>{n.message}</Text>
-                  </View>
+              {alerts.length === 0 ? (
+                <View style={[styles.notifItem, { justifyContent: 'center' }]}>
+                  <Text style={styles.notifMessage}>
+                    Nothing to flag yet. Log water, meals or habits and updates will appear here.
+                  </Text>
                 </View>
-              ))}
+              ) : (
+                alerts.map((a) => (
+                  <View key={a.id} style={styles.notifItem}>
+                    <View style={[styles.notifIconBox, { backgroundColor: a.bg }]}>
+                      <Ionicons name={a.icon} size={20} color={a.color} />
+                    </View>
+                    <View style={styles.notifContent}>
+                      <View style={styles.notifTitleRow}>
+                        <Text style={styles.notifTitle}>{a.title}</Text>
+                      </View>
+                      <Text style={styles.notifMessage}>{a.message}</Text>
+                    </View>
+                  </View>
+                ))
+              )}
             </ScrollView>
           </Pressable>
         </Pressable>
